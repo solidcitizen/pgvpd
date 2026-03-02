@@ -13,13 +13,23 @@ mod tls;
 
 use tracing_subscriber::EnvFilter;
 
-const BANNER: &str = r#"
+fn banner() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    let label = format!("P G V P D  v{version}");
+    let pad_total = 48 - label.len();
+    let pad_left = pad_total / 2;
+    let pad_right = pad_total - pad_left;
+    format!(
+        r#"
   ╔══════════════════════════════════════════════════╗
-  ║                  P G V P D  v0.6                 ║
+  ║{:pad_left$}{label}{:pad_right$}║
   ║      Virtual Private Database for PostgreSQL     ║
   ║                    [ Rust ]                      ║
   ╚══════════════════════════════════════════════════╝
-"#;
+"#,
+        "", "",
+    )
+}
 
 #[tokio::main]
 async fn main() {
@@ -34,7 +44,7 @@ async fn main() {
         .with_timer(tracing_subscriber::fmt::time::uptime())
         .init();
 
-    eprintln!("{BANNER}");
+    eprintln!("{}", banner());
 
     if let Err(e) = proxy::run(config).await {
         eprintln!("fatal: {e}");
