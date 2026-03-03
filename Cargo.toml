@@ -1,6 +1,6 @@
 [package]
 name = "pgvpd"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2024"
 description = "Virtual Private Database for PostgreSQL — tenant isolation at the connection level"
 license = "MIT"

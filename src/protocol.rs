@@ -767,6 +767,7 @@ mod tests {
         assert_eq!(escape_set_value("{a,b,c}"), "'{a,b,c}'");
         assert_eq!(escape_set_value("it's"), "'it''s'");
         assert_eq!(escape_set_value("a'b'c"), "'a''b''c'");
+        assert_eq!(escape_set_value(""), "''");
     }
 
     #[test]

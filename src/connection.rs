@@ -357,11 +357,6 @@ async fn handshake(
         return Ok((HandshakeResult::Done, None));
     }
 
-    if context_values.iter().any(|v| v.is_empty()) {
-        send_error(client, "FATAL", "28000", "empty context value in username").await;
-        return Ok((HandshakeResult::Done, None));
-    }
-
     info!(
         conn_id,
         role = actual_user,

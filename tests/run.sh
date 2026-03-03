@@ -600,6 +600,48 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Suite 8: Multi-Context
+# ═══════════════════════════════════════════════════════════════════════════
+
+echo ""
+echo "═══ Suite 8: Multi-Context ═══"
+start_pgvpd tests/pgvpd-multicontext-test.conf
+
+# Test 8.1: Multi-context with all values populated
+result=$(run_psql "app_user.val_a:val_b" -c "SELECT current_setting('app.ctx_a', true) || ',' || current_setting('app.ctx_b', true)")
+if echo "$result" | grep -q "val_a,val_b"; then
+  pass "8.1 Multi-context — both variables set correctly"
+else
+  fail "8.1 Multi-context — unexpected result: $result"
+fi
+
+# Test 8.2: Multi-context with second value empty
+result=$(run_psql "app_user.val_a:" -c "SELECT current_setting('app.ctx_a', true) || ',' || current_setting('app.ctx_b', true)")
+if echo "$result" | grep -q "val_a,"; then
+  pass "8.2 Multi-context — empty second segment accepted"
+else
+  fail "8.2 Multi-context — unexpected result: $result"
+fi
+
+# Test 8.3: Multi-context with first value empty
+result=$(run_psql "app_user.:val_b" -c "SELECT current_setting('app.ctx_a', true) || ',' || current_setting('app.ctx_b', true)")
+if echo "$result" | grep -q ",val_b"; then
+  pass "8.3 Multi-context — empty first segment accepted"
+else
+  fail "8.3 Multi-context — unexpected result: $result"
+fi
+
+# Test 8.4: Wrong number of values — still rejected
+result=$(run_psql "app_user.only_one" -c "SELECT 1" 2>&1)
+if echo "$result" | grep -qi "fatal\|error\|refused\|closed"; then
+  pass "8.4 Multi-context — wrong segment count rejected"
+else
+  fail "8.4 Multi-context — expected rejection, got: $result"
+fi
+
+stop_pgvpd
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Summary
 # ═══════════════════════════════════════════════════════════════════════════
 
