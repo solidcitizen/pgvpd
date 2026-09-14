@@ -59,6 +59,18 @@ anything unaccountable is discarded.
 | drain timeout | gap | covered by the COPY case above | raise timeout to infinity |
 | unit | have | `BackendFrameTracker` tests (split headers, split bodies, 'Z' inside a body, malformed length) | — |
 
+**Dead end — do not retry.** A single-client harness cannot force the poison
+deterministically. With `pool_size = 1` and one client that sends
+`SELECT pg_sleep(...)` then drops its socket, the old (1.0.2) checkin reads
+the stray `DISCARD ALL` reply into its own scratch buffer and drops it when
+checkin returns, so the socket ends up clean and the broken build looks
+correct. The defect is concurrency-dependent: it takes interleaved reads
+across the shared pool to strand a response on the wire, which is why 7P.4
+uses a concurrent storm. The deterministic red side must therefore come from
+either the mutant (revert the drain block in `Pool::checkin`) or the planned
+`raw-frames.mjs` with a proxy-side hook that hands back a slot with a known
+number of responses still outstanding — not from a client-only script.
+
 ### 3. Reset completeness
 
 A new holder never sees the previous holder's state. `ROLLBACK` then
