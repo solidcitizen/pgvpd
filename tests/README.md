@@ -38,6 +38,27 @@ The script handles everything: starts Postgres in Docker, loads fixtures, builds
 | 3.3 | Resolver | Cache hit | Resolver result caching |
 | 7P.4 | Pool | node-pg churn + socket drops | `tests/drizzle/pool-desync.mjs` on `pgvpd-pool-desync-test.conf`: no protocol error, no shifted/empty result (issue #11) |
 
+## Diagnostics
+
+### `same-slot-probe.sh` — #14 drain-pin measurement
+
+`./tests/same-slot-probe.sh` measures how long an abandoned in-flight query
+pins a pooled slot before the next client can reuse it (issue #14). It runs
+pgvpd on a single-connection pool (`pgvpd-pool-size1.conf`) so the next
+checkout must reuse the abandoned slot, and reports the pin in milliseconds.
+
+```bash
+./tests/same-slot-probe.sh                    # measure (SLEEP_S=3)
+SLEEP_S=8 ./tests/same-slot-probe.sh          # longer abandoned query (hits the 5s cap)
+THRESHOLD_MS=200 ./tests/same-slot-probe.sh   # red-then-green pin: RED until #14 cancels the query
+PGVPD_BIN=/path/to/pgvpd ./tests/same-slot-probe.sh
+```
+
+On 1.0.3 the pin is ~the abandoned query's remaining runtime, capped at the
+5s reset timeout (then the slot is discarded and recreated); results are always
+correct. It is a measurement, not part of `run.sh`; `THRESHOLD_MS` turns it into
+a pass/fail assertion for verifying the #14 fix.
+
 ## Architecture
 
 - **`docker-compose.yml`** — Postgres 17 on port 15432 (avoids conflicts with local Postgres or Supabase)
