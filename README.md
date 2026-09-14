@@ -333,6 +333,13 @@ returned to the idle pool. An idle reaper closes connections that have been
 unused longer than `pool_idle_timeout`. Superuser bypass connections are
 never pooled.
 
+If a client disconnects while a query is still in flight, pgvpd first drains
+the responses that client never read (bounded by the 5-second reset timeout)
+and only then resets and returns the connection. A connection that cannot be
+brought to a known state is closed rather than reused, so a later client never
+sees another session's messages. `pgvpd_pool_drains_total` on the admin
+`/metrics` endpoint counts these events.
+
 ## TLS
 
 **TLS termination** (client → Pgvpd): clients connect over TLS to

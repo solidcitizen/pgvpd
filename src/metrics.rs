@@ -18,6 +18,8 @@ pub struct Metrics {
     pub pool_checkins: AtomicU64,
     pub pool_discards: AtomicU64,
     pub pool_timeouts: AtomicU64,
+    /// Checkins that had to drain responses a departed client never read.
+    pub pool_drains: AtomicU64,
 
     // ─── Resolvers ───────────────────────────────────────────────────────
     pub resolver_cache_hits: AtomicU64,
@@ -50,6 +52,7 @@ impl Metrics {
             pool_checkins: AtomicU64::new(0),
             pool_discards: AtomicU64::new(0),
             pool_timeouts: AtomicU64::new(0),
+            pool_drains: AtomicU64::new(0),
             resolver_cache_hits: AtomicU64::new(0),
             resolver_cache_misses: AtomicU64::new(0),
             resolver_executions: (0..n).map(|_| AtomicU64::new(0)).collect(),

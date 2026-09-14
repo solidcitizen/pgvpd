@@ -31,9 +31,12 @@ The script handles everything: starts Postgres in Docker, loads fixtures, builds
 | 2.2 | Pool | Bad password | Client auth rejection |
 | 2.3 | Pool | Superuser bypass | Superuser never pooled |
 | 2.4 | Pool | Connection reuse | Pool checkout/checkin cycle |
+| 2.5 | Pool | Client killed mid-query | Next holder of the connection sees only its own result (issue #11) |
+| 2.6 | Pool | Drain on checkin | Abandoned responses are drained before reset (log) |
 | 3.1 | Resolver | Context resolved | Resolver SQL populates session vars |
 | 3.2 | Resolver | No rows | Empty context on unknown user (fail-closed) |
 | 3.3 | Resolver | Cache hit | Resolver result caching |
+| 7P.4 | Pool | node-pg churn + socket drops | `tests/drizzle/pool-desync.mjs` on `pgvpd-pool-desync-test.conf`: no protocol error, no shifted/empty result (issue #11) |
 
 ## Architecture
 

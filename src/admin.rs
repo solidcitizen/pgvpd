@@ -158,6 +158,16 @@ async fn metrics(State(state): State<AdminState>) -> Response {
         "",
         m.pool_timeouts.load(Ordering::Relaxed),
     );
+    out.push_str(
+        "# HELP pgvpd_pool_drains_total Checkins that drained responses a departed client left in flight.\n",
+    );
+    out.push_str("# TYPE pgvpd_pool_drains_total counter\n");
+    push_metric(
+        &mut out,
+        "pgvpd_pool_drains_total",
+        "",
+        m.pool_drains.load(Ordering::Relaxed),
+    );
 
     // Resolver metrics
     if let Some(resolver) = &state.resolver {
