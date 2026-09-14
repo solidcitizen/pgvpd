@@ -32,6 +32,19 @@ All notable changes to pgvpd are documented here.
   drops, asserting no protocol error and no shifted or empty result); unit
   tests for the backend frame tracker.
 
+## [1.0.2] — 2026-03-03
+
+Commit `0ce3be6`. This version shipped as the running binary on the NexusPlus
+production host and is the baseline against which the #11 fix was verified
+(red on 1.0.2, green on 1.0.3). It was not tagged or published at the time;
+the git tag `baseline/1.0.2` marks the commit for that red-then-green record.
+
+### Changed
+- Allow empty context segments in multi-variable usernames: an omitted
+  dimension (e.g. `app_user.val_a:` with an empty second segment) is injected
+  as `SET var = ''`, which is fail-closed for RLS, instead of a fatal auth
+  error. (#10)
+
 ## [1.0.0] — 2026-02-26
 
 ### Released
