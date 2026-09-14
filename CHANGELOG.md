@@ -2,6 +2,20 @@
 
 All notable changes to pgvpd are documented here.
 
+## [1.0.4] — 2026-09-14
+
+### Fixed
+- Pool mode: a checkout that reserved a slot (`bucket.total += 1`) and was then
+  cancelled — the per-connection handshake timeout dropping the future while
+  `create_connection` was still awaiting a slow/unresponsive upstream — never
+  released that slot. Each cancelled checkout leaked one phantom slot; enough
+  leaks pinned `total` at `pool_size` with zero real connections, permanently
+  wedging the bucket (every later checkout failed `pool checkout timeout` until
+  restart). The reserved slot is now held by an RAII guard
+  (`SlotReservation`) that releases it on every exit — error or cancellation —
+  and is disarmed only once the connection exists. Pre-existing since pooling
+  (0.3); present in 1.0.0–1.0.3. (#20)
+
 ## [1.0.3] — 2026-09-13
 
 ### Fixed

@@ -37,6 +37,8 @@ The script handles everything: starts Postgres in Docker, loads fixtures, builds
 | 3.2 | Resolver | No rows | Empty context on unknown user (fail-closed) |
 | 3.3 | Resolver | Cache hit | Resolver result caching |
 | 7P.4 | Pool | node-pg churn + socket drops | `tests/drizzle/pool-desync.mjs` on `pgvpd-pool-desync-test.conf`: no protocol error, no shifted/empty result (issue #11) |
+| 9.1 | Pool | Cancelled checkout (black-hole upstream) | Reserved slot released; bucket total returns to 0 (issue #20) |
+| 9.2 | Pool | Not wedged after cancels | Fresh checkout is not blocked by leaked slots (issue #20) |
 
 ## Diagnostics
 

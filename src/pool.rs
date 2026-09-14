@@ -161,10 +161,26 @@ impl Pool {
             };
 
             if reserved_slot {
+                // Hold the reserved slot in an RAII guard so it is released on
+                // EVERY exit from the create: an Err return, and — critically —
+                // a cancellation. `checkout` runs inside the per-connection
+                // handshake timeout (`tokio::time::timeout`), so if
+                // `create_connection` outlives it the future is dropped mid-await
+                // and neither match arm runs. Without the guard the reserved
+                // `total` would never be decremented, leaking a phantom slot;
+                // enough leaks pin `total` at `pool_size` and wedge the bucket
+                // permanently (issue #20). The guard is disarmed only once the
+                // connection exists and its slot is owned by the returned conn.
+                let mut reservation = SlotReservation {
+                    pool: self,
+                    key,
+                    armed: true,
+                };
                 Metrics::inc(&self.metrics.pool_creates);
                 debug!(conn_id, database = %key.database, role = %key.role, "pool: creating new connection");
                 match self.create_connection(key, conn_id).await {
                     Ok(conn) => {
+                        reservation.disarm();
                         // Cache handshake data on first connection for this bucket
                         let mut buckets = self.lock_buckets();
                         if let Some(bucket) = buckets.get_mut(key)
@@ -177,8 +193,7 @@ impl Pool {
                         return Ok(conn);
                     }
                     Err(e) => {
-                        // Release the reserved slot on failure
-                        self.decrement_total(key);
+                        // `reservation` drops here and releases the slot.
                         return Err(e);
                     }
                 }
@@ -471,6 +486,38 @@ impl Pool {
     /// a poisoned mutex (a panic while locked) is recovered rather than spread.
     fn lock_buckets(&self) -> std::sync::MutexGuard<'_, HashMap<PoolKey, PoolBucket>> {
         self.buckets.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// RAII guard for a slot reserved in [`Pool::checkout`] before its upstream
+/// connection exists.
+///
+/// `checkout` increments `bucket.total` under the lock, then awaits
+/// `create_connection`. It runs inside the per-connection handshake timeout, so
+/// that await can be dropped mid-flight (the upstream accepted the socket but is
+/// slow to answer the startup). This guard decrements the reserved slot on every
+/// drop — Err return or cancellation — unless [`disarm`](Self::disarm) is called
+/// once the connection exists and owns the slot. Without it a cancelled create
+/// leaks the slot, and enough leaks pin `total` at `pool_size` and wedge the
+/// bucket permanently (issue #20).
+struct SlotReservation<'a> {
+    pool: &'a Pool,
+    key: &'a PoolKey,
+    armed: bool,
+}
+
+impl SlotReservation<'_> {
+    /// The created connection now owns the slot; do not release it on drop.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SlotReservation<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.pool.decrement_total(self.key);
+        }
     }
 }
 
