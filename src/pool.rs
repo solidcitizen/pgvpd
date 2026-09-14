@@ -7,16 +7,18 @@ use bytes::BytesMut;
 use rustls::ClientConfig;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::auth;
 use crate::config::Config;
-use crate::connection::connect_upstream;
+use crate::connection::{PipeEnd, PipeOutcome, connect_upstream};
 use crate::metrics::Metrics;
-use crate::protocol::{build_query_message, build_startup_message, try_read_backend_message};
+use crate::protocol::{
+    BackendFrameTracker, build_query_message, build_startup_message, try_read_backend_message,
+};
 use crate::stream::UpstreamStream;
 
 /// Pool key — identifies a bucket of reusable connections.
@@ -98,7 +100,7 @@ impl Pool {
 
     /// Snapshot of current pool state (for admin API).
     pub async fn snapshot(&self) -> PoolSnapshot {
-        let buckets = self.buckets.lock().await;
+        let buckets = self.lock_buckets();
         let mut result = Vec::with_capacity(buckets.len());
         for (key, bucket) in buckets.iter() {
             result.push(PoolBucketSnapshot {
@@ -122,8 +124,11 @@ impl Pool {
         let deadline = Instant::now() + timeout;
 
         loop {
-            {
-                let mut buckets = self.buckets.lock().await;
+            // The bucket lock is a std mutex: it must not be held across an
+            // await, so the locked section decides what to do and ends before
+            // any connecting happens.
+            let reserved_slot = {
+                let mut buckets = self.lock_buckets();
                 let bucket = buckets.entry(key.clone()).or_insert_with(PoolBucket::new);
 
                 // Try to pop an idle connection
@@ -146,34 +151,35 @@ impl Pool {
                     return Ok(conn);
                 }
 
-                // Create new if under limit
+                // Reserve a slot for a new connection if under limit
                 if bucket.total < self.config.pool_size {
                     bucket.total += 1;
-                    drop(buckets); // Release lock before connecting
-                    Metrics::inc(&self.metrics.pool_creates);
-                    debug!(conn_id, database = %key.database, role = %key.role, "pool: creating new connection");
-                    match self.create_connection(key, conn_id).await {
-                        Ok(conn) => {
-                            // Cache handshake data on first connection for this bucket
-                            let mut buckets = self.buckets.lock().await;
-                            if let Some(bucket) = buckets.get_mut(key)
-                                && bucket.cached_param_statuses.is_none()
-                            {
-                                bucket.cached_param_statuses = Some(conn.param_statuses.clone());
-                                bucket.cached_backend_key_data =
-                                    Some(conn.backend_key_data.clone());
-                            }
-                            Metrics::inc(&self.metrics.pool_checkouts);
-                            return Ok(conn);
+                    true
+                } else {
+                    false
+                }
+            };
+
+            if reserved_slot {
+                Metrics::inc(&self.metrics.pool_creates);
+                debug!(conn_id, database = %key.database, role = %key.role, "pool: creating new connection");
+                match self.create_connection(key, conn_id).await {
+                    Ok(conn) => {
+                        // Cache handshake data on first connection for this bucket
+                        let mut buckets = self.lock_buckets();
+                        if let Some(bucket) = buckets.get_mut(key)
+                            && bucket.cached_param_statuses.is_none()
+                        {
+                            bucket.cached_param_statuses = Some(conn.param_statuses.clone());
+                            bucket.cached_backend_key_data = Some(conn.backend_key_data.clone());
                         }
-                        Err(e) => {
-                            // Decrement total on failure
-                            let mut buckets = self.buckets.lock().await;
-                            if let Some(bucket) = buckets.get_mut(key) {
-                                bucket.total = bucket.total.saturating_sub(1);
-                            }
-                            return Err(e);
-                        }
+                        Metrics::inc(&self.metrics.pool_checkouts);
+                        return Ok(conn);
+                    }
+                    Err(e) => {
+                        // Release the reserved slot on failure
+                        self.decrement_total(key);
+                        return Err(e);
                     }
                 }
             }
@@ -188,8 +194,43 @@ impl Pool {
     }
 
     /// Return a connection to the pool after use.
-    /// Sends ROLLBACK; DISCARD ALL; to reset state, then pushes to idle.
-    pub async fn checkin(&self, key: PoolKey, mut stream: UpstreamStream, conn_id: u64) {
+    ///
+    /// The pipe reports how the session ended and how many responses upstream
+    /// still owes for requests it already received. Anything outstanding is
+    /// drained first, then `ROLLBACK` and `DISCARD ALL` reset the session, so
+    /// the next holder never finds a stale message on the wire (issue #11).
+    /// A connection whose protocol state cannot be trusted is discarded.
+    pub async fn checkin(
+        &self,
+        key: PoolKey,
+        mut stream: UpstreamStream,
+        conn_id: u64,
+        mut outcome: PipeOutcome,
+    ) {
+        if matches!(
+            outcome.end,
+            PipeEnd::UpstreamClosed | PipeEnd::UpstreamError(_)
+        ) {
+            Metrics::inc(&self.metrics.pool_discards);
+            debug!(conn_id, "pool: upstream gone, discarding connection");
+            self.decrement_total(&key);
+            return;
+        }
+
+        if outcome.framing_lost || outcome.rfq_received > outcome.sync_points_sent {
+            Metrics::inc(&self.metrics.pool_discards);
+            warn!(
+                conn_id,
+                sync_points = outcome.sync_points_sent,
+                ready_for_query = outcome.rfq_received,
+                "pool: protocol state unknown, discarding connection"
+            );
+            self.decrement_total(&key);
+            return;
+        }
+
+        let outstanding = outcome.sync_points_sent - outcome.rfq_received;
+
         // Reset the connection in two steps:
         // 1. ROLLBACK — ends any open transaction (no-op if idle)
         // 2. DISCARD ALL — resets all session state
@@ -200,6 +241,27 @@ impl Pool {
         let reset_timeout = Duration::from_secs(5);
 
         match tokio::time::timeout(reset_timeout, async {
+            // Step 0: drain responses the departed client never read, so the
+            // ReadyForQuery consumed by each step below is that step's own.
+            if outstanding > 0 || outcome.tracker.mid_message() {
+                Metrics::inc(&self.metrics.pool_drains);
+                info!(
+                    conn_id,
+                    outstanding,
+                    "pool: client left with responses outstanding — draining before reset"
+                );
+                if !Self::drain_outstanding(
+                    &mut stream,
+                    &mut outcome.tracker,
+                    outstanding,
+                    &mut buf,
+                )
+                .await
+                {
+                    warn!(conn_id, "pool: drain failed, discarding");
+                    return false;
+                }
+            }
             // Step 1: ROLLBACK
             if !Self::send_and_drain(&mut stream, "ROLLBACK", &mut buf, conn_id).await {
                 return false;
@@ -212,7 +274,7 @@ impl Pool {
             Ok(true) => {
                 // Connection is clean — return to pool
                 Metrics::inc(&self.metrics.pool_checkins);
-                let mut buckets = self.buckets.lock().await;
+                let mut buckets = self.lock_buckets();
                 if let Some(bucket) = buckets.get_mut(&key) {
                     // Re-create a minimal PooledConn for the idle queue
                     // (param_statuses and backend_key_data are preserved from creation)
@@ -237,9 +299,30 @@ impl Pool {
             _ => {
                 Metrics::inc(&self.metrics.pool_discards);
                 warn!(conn_id, "pool: reset failed or timed out, discarding");
-                self.decrement_total(&key).await;
+                self.decrement_total(&key);
             }
         }
+    }
+
+    /// Read from upstream until `outstanding` ReadyForQuery messages have been
+    /// consumed and the stream sits on a message boundary. Returns false on EOF
+    /// or read error. Bytes are discarded: they were for a client that is gone.
+    async fn drain_outstanding(
+        stream: &mut UpstreamStream,
+        tracker: &mut BackendFrameTracker,
+        mut outstanding: u64,
+        buf: &mut BytesMut,
+    ) -> bool {
+        while outstanding > 0 || tracker.mid_message() {
+            buf.clear();
+            match stream.read_buf(buf).await {
+                Ok(0) | Err(_) => return false,
+                Ok(_) => {}
+            }
+            outstanding = outstanding.saturating_sub(tracker.feed(buf));
+        }
+        buf.clear();
+        true
     }
 
     /// Send a SimpleQuery and drain responses until ReadyForQuery.
@@ -346,7 +429,7 @@ impl Pool {
         loop {
             tokio::time::sleep(interval).await;
 
-            let mut buckets = self.buckets.lock().await;
+            let mut buckets = self.lock_buckets();
             let mut total_reaped = 0u32;
 
             for (key, bucket) in buckets.iter_mut() {
@@ -377,10 +460,59 @@ impl Pool {
         }
     }
 
-    async fn decrement_total(&self, key: &PoolKey) {
-        let mut buckets = self.buckets.lock().await;
+    fn decrement_total(&self, key: &PoolKey) {
+        let mut buckets = self.lock_buckets();
         if let Some(bucket) = buckets.get_mut(key) {
             bucket.total = bucket.total.saturating_sub(1);
+        }
+    }
+
+    /// Lock the bucket map. The guard is never held across an await point, so
+    /// a poisoned mutex (a panic while locked) is recovered rather than spread.
+    fn lock_buckets(&self) -> std::sync::MutexGuard<'_, HashMap<PoolKey, PoolBucket>> {
+        self.buckets.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// A checked-out pool slot.
+///
+/// Consumed by [`PoolLease::checkin`]. Dropping it any other way — an error
+/// after checkout, a handshake timeout cancelling the future — releases the
+/// slot so the bucket's `total` never drifts above the connections that exist.
+pub struct PoolLease {
+    pool: Arc<Pool>,
+    key: PoolKey,
+    armed: bool,
+}
+
+impl PoolLease {
+    pub fn new(pool: Arc<Pool>, key: PoolKey) -> Self {
+        Self {
+            pool,
+            key,
+            armed: true,
+        }
+    }
+
+    /// Return the connection to the pool (or discard it), consuming the lease.
+    pub async fn checkin(mut self, stream: UpstreamStream, conn_id: u64, outcome: PipeOutcome) {
+        self.armed = false;
+        let pool = Arc::clone(&self.pool);
+        pool.checkin(self.key.clone(), stream, conn_id, outcome)
+            .await;
+    }
+}
+
+impl Drop for PoolLease {
+    fn drop(&mut self) {
+        if self.armed {
+            debug!(
+                database = %self.key.database,
+                role = %self.key.role,
+                "pool: lease dropped without checkin — releasing slot"
+            );
+            Metrics::inc(&self.pool.metrics.pool_discards);
+            self.pool.decrement_total(&self.key);
         }
     }
 }

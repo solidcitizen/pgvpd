@@ -62,9 +62,14 @@ fail() {
   echo "  FAIL: $1"
 }
 
-PGVPD_BIN="./target/debug/pgvpd"
-if [ "$CI_MODE" = true ] && [ -f "./target/release/pgvpd" ]; then
-  PGVPD_BIN="./target/release/pgvpd"
+# Binary under test. Override with PGVPD_BIN=/path/to/pgvpd to run the suite
+# against another build (a release candidate, or an old version to prove a
+# regression test goes red without its fix).
+if [ -z "${PGVPD_BIN:-}" ]; then
+  PGVPD_BIN="./target/debug/pgvpd"
+  if [ "$CI_MODE" = true ] && [ -f "./target/release/pgvpd" ]; then
+    PGVPD_BIN="./target/release/pgvpd"
+  fi
 fi
 
 start_pgvpd() {
@@ -220,6 +225,46 @@ if pgvpd_log | grep -q "reusing idle connection"; then
   pass "2.4 Pool reuse — idle connection reused"
 else
   fail "2.4 Pool reuse — no 'reusing idle connection' in logs"
+fi
+
+# Test 2.5: A client that vanishes mid-query must not poison the connection
+# for its next holder (issue #11). Three sessions start a slow query and are
+# killed before it answers; the sessions that reuse those connections must
+# see exactly their own result — no stale command tags, no shifted rows.
+vanish_pids=""
+for _ in 1 2 3; do
+  PGPASSWORD="$PG_PASS" psql -h $PG_HOST -p $PGVPD_PORT -U "app_user.tenant_a" -d $PG_DB \
+    -t -A --no-psqlrc -c "SELECT pg_sleep(2)" > /dev/null 2>&1 &
+  vanish_pids="$vanish_pids $!"
+done
+# Kill only once all three queries are running server-side, so each client
+# really does leave a response in flight (a fixed sleep races psql startup).
+for _ in $(seq 1 50); do
+  active=$(PGPASSWORD="$PG_PASS" psql -h $PG_HOST -p $PG_PORT -U $PG_USER -d $PG_DB -t -A --no-psqlrc \
+    -c "SELECT count(*) FROM pg_stat_activity WHERE state = 'active' AND query LIKE 'SELECT pg_sleep(2)%'" 2>/dev/null || echo 0)
+  if [ "${active:-0}" -ge 3 ]; then break; fi
+  sleep 0.1
+done
+kill -9 $vanish_pids 2>/dev/null || true
+wait $vanish_pids 2>/dev/null || true
+desync=""
+for k in 1 2 3 4 5 6; do
+  result=$(run_psql "app_user.tenant_b" -c "SELECT current_setting('app.current_tenant_id') || '/' || count(*) FROM tenants")
+  if [ "$result" != "tenant_b/2" ]; then
+    desync="${desync} [run $k: $result]"
+  fi
+done
+if [ -z "$desync" ]; then
+  pass "2.5 Pool — client dropped mid-query does not poison the next holder"
+else
+  fail "2.5 Pool — stale session state reached the next holder:$desync"
+fi
+
+# Test 2.6: 2.5 passed because the abandoned responses were drained at checkin
+if pgvpd_log | grep -q "draining before reset"; then
+  pass "2.6 Pool — outstanding responses drained on checkin"
+else
+  fail "2.6 Pool — no 'draining before reset' in logs"
 fi
 
 stop_pgvpd
@@ -594,6 +639,22 @@ else
     pass "7P.3 Drizzle pool — superuser bypass"
   else
     fail "7P.x Drizzle pool tests failed (exit code $drizzle_pool_result)"
+  fi
+
+  stop_pgvpd
+
+  # Test 7P.4: concurrent node-postgres churn with periodic mid-query socket
+  # drops; every query on a fresh holder must return exactly its own result
+  # (issue #11). Runs on its own config (pool_size >= concurrency, see the
+  # conf) because a saturated pool masks the defect. Prints a JSON summary;
+  # exit 2 on any protocol error or a shifted/empty result.
+  start_pgvpd tests/pgvpd-pool-desync-test.conf
+  desync_result=0
+  (cd tests/drizzle && PGVPD_HOST=$PG_HOST PGVPD_PORT=$PGVPD_PORT PG_DB=$PG_DB PG_PASS=$PG_PASS node pool-desync.mjs poison) || desync_result=$?
+  if [ $desync_result -eq 0 ]; then
+    pass "7P.4 node-pg pool — mid-query disconnects never shift another client's result"
+  else
+    fail "7P.4 node-pg pool — desync regression (exit code $desync_result)"
   fi
 
   stop_pgvpd

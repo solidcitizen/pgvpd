@@ -2,6 +2,49 @@
 
 All notable changes to pgvpd are documented here.
 
+## [1.0.3] — 2026-09-13
+
+### Fixed
+- Pool mode: a client that disconnected while a query was still in flight left
+  its unread response on the shared upstream connection. The checkin reset
+  consumed the wrong `ReadyForQuery`, so the next holder of that connection
+  received a stale `CommandComplete` (node-postgres: "Received unexpected
+  commandComplete message from backend") or had its first query resolved with
+  an empty, shifted result and no error. The pooled pipe now counts request
+  sync points (`Query`, `Sync`, `FunctionCall`) against `ReadyForQuery`
+  received, and checkin drains anything outstanding before `ROLLBACK` /
+  `DISCARD ALL`. A connection whose protocol state cannot be verified — drain
+  timeout, EOF, framing mismatch — is closed instead of reused. (#11)
+- Pool mode: any error or handshake timeout after checkout (upstream gone,
+  client gone, injection failure) dropped the upstream connection without
+  releasing its slot, so a bucket's `total` drifted above the connections that
+  existed until every checkout timed out. Checked-out slots are now held by a
+  lease that is released on every exit path.
+- Pool mode: bytes upstream sent after the injection's `ReadyForQuery`
+  (asynchronous notices) were silently dropped instead of forwarded.
+
+### Added
+- `pgvpd_pool_drains_total` metric and an info-level log line
+  (`pool: client left with responses outstanding — draining before reset`)
+  so operators can see how often clients abandon queries in flight.
+- Integration tests 2.5/2.6 (psql sessions killed mid-query) and 7P.4
+  (`tests/drizzle/pool-desync.mjs`: node-postgres churn with mid-query socket
+  drops, asserting no protocol error and no shifted or empty result); unit
+  tests for the backend frame tracker.
+
+## [1.0.2] — 2026-03-03
+
+Commit `0ce3be6`. This version shipped as the running binary on the NexusPlus
+production host and is the baseline against which the #11 fix was verified
+(red on 1.0.2, green on 1.0.3). It was not tagged or published at the time;
+the git tag `baseline/1.0.2` marks the commit for that red-then-green record.
+
+### Changed
+- Allow empty context segments in multi-variable usernames: an omitted
+  dimension (e.g. `app_user.val_a:` with an empty second segment) is injected
+  as `SET var = ''`, which is fail-closed for RLS, instead of a fatal auth
+  error. (#10)
+
 ## [1.0.0] — 2026-02-26
 
 ### Released

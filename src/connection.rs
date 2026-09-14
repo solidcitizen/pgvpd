@@ -19,10 +19,11 @@ use tracing::{debug, error, info, warn};
 use crate::auth;
 use crate::config::{Config, PoolMode};
 use crate::metrics::Metrics;
-use crate::pool::{Pool, PoolKey};
+use crate::pool::{Pool, PoolKey, PoolLease};
 use crate::protocol::{
-    SSL_DENY, StartupType, build_error_response, build_query_message, build_startup_message,
-    escape_set_value, quote_ident, try_read_backend_message, try_read_startup,
+    BackendFrameTracker, SSL_DENY, StartupType, build_error_response, build_query_message,
+    build_startup_message, escape_set_value, quote_ident, try_read_backend_message,
+    try_read_startup,
 };
 use crate::resolver::ResolverEngine;
 use crate::stream::{ClientStream, UpstreamStream};
@@ -36,8 +37,11 @@ pub enum HandshakeResult {
     /// Pooled — connection checked out from pool, must be returned on disconnect.
     Pooled {
         stream: UpstreamStream,
-        key: PoolKey,
-        pool: Arc<Pool>,
+        /// The pool slot; consumed by checkin, released on drop otherwise.
+        lease: PoolLease,
+        /// Bytes upstream sent after the injection's ReadyForQuery (async
+        /// messages such as notices). They belong to the client.
+        leftover: BytesMut,
     },
     /// Fully handled (cancel request, error, etc.) — nothing more to do.
     Done,
@@ -129,80 +133,165 @@ pub async fn handle_connection(
         }
         HandshakeResult::Pooled {
             mut stream,
-            key,
-            pool,
+            lease,
+            leftover,
         } => {
             debug!(conn_id, "transparent pipe (pooled)");
-            if let Err(e) = pipe_pooled(
+            let outcome = pipe_pooled(
                 &mut client,
                 &mut stream,
+                leftover,
                 conn_id,
                 query_timeout,
                 &config_metrics,
             )
-            .await
-            {
+            .await;
+            if let Some(e) = outcome.end.error() {
                 debug!(conn_id, error = %e, "connection ended");
             }
-            pool.checkin(key, stream, conn_id).await;
+            lease.checkin(stream, conn_id, outcome).await;
         }
     }
+}
+
+/// How a pooled pipe ended.
+pub enum PipeEnd {
+    /// Client sent Terminate or closed its socket.
+    ClientClosed,
+    /// Reading from or writing to the client failed.
+    ClientError(std::io::Error),
+    /// Upstream closed its socket.
+    UpstreamClosed,
+    /// Reading from or writing to upstream failed.
+    UpstreamError(std::io::Error),
+    /// Tenant query timeout fired.
+    Timeout,
+}
+
+impl PipeEnd {
+    /// The error that ended the pipe, if any.
+    pub fn error(&self) -> Option<&std::io::Error> {
+        match self {
+            PipeEnd::ClientError(e) | PipeEnd::UpstreamError(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+/// Protocol bookkeeping the pipe hands to the pool at checkin.
+///
+/// Postgres answers every Query, Sync, and FunctionCall with exactly one
+/// ReadyForQuery. Comparing what was forwarded with what came back tells the
+/// pool whether the departed client left a response in flight.
+pub struct PipeOutcome {
+    pub end: PipeEnd,
+    /// Frontend messages forwarded that each owe one ReadyForQuery.
+    pub sync_points_sent: u64,
+    /// ReadyForQuery messages received from upstream.
+    pub rfq_received: u64,
+    /// Upstream framing state when the pipe ended.
+    pub tracker: BackendFrameTracker,
+    /// Frontend framing could not be parsed; upstream state is unknown.
+    pub framing_lost: bool,
 }
 
 /// Bidirectional pipe for pooled connections.
 ///
 /// Unlike `copy_bidirectional`, this intercepts the Postgres Terminate message
-/// ('X') from the client so the upstream connection stays alive for pool reuse.
+/// ('X') from the client so the upstream connection stays alive for pool reuse,
+/// and it counts request/response sync points so the pool can drain whatever
+/// the client left in flight before the connection is reused.
 /// If `query_timeout` is set, the connection is terminated after that many seconds
 /// of inactivity (no data in either direction).
 async fn pipe_pooled(
     client: &mut ClientStream,
     server: &mut UpstreamStream,
+    mut server_buf: BytesMut,
     conn_id: u64,
     query_timeout: Option<Duration>,
     metrics: &Metrics,
-) -> std::io::Result<()> {
+) -> PipeOutcome {
     use std::pin::pin;
     use tokio::time::Instant;
 
     let mut client_buf = BytesMut::with_capacity(8192);
-    let mut server_buf = BytesMut::with_capacity(8192);
+    let mut tracker = BackendFrameTracker::default();
+    let mut sync_points_sent: u64 = 0;
+    let mut rfq_received: u64 = 0;
+    let mut framing_lost = false;
     let idle_timeout = query_timeout.unwrap_or(Duration::from_secs(86400 * 365));
     let mut deadline = pin!(tokio::time::sleep(idle_timeout));
+
+    macro_rules! finish {
+        ($end:expr) => {
+            return PipeOutcome {
+                end: $end,
+                sync_points_sent,
+                rfq_received,
+                tracker,
+                framing_lost,
+            }
+        };
+    }
+
+    // Anything upstream sent after the injection's ReadyForQuery is the client's.
+    if !server_buf.is_empty() {
+        rfq_received += tracker.feed(&server_buf);
+        if let Err(e) = client.write_all(&server_buf).await {
+            finish!(PipeEnd::ClientError(e));
+        }
+        server_buf.clear();
+    }
+    server_buf.reserve(8192);
 
     loop {
         tokio::select! {
             result = client.read_buf(&mut client_buf) => {
-                let n = result?;
-                if n == 0 {
-                    debug!(conn_id, "client EOF (no Terminate)");
-                    return Ok(());
+                match result {
+                    Ok(0) => {
+                        debug!(conn_id, "client EOF (no Terminate)");
+                        finish!(PipeEnd::ClientClosed);
+                    }
+                    Ok(_) => {}
+                    Err(e) => finish!(PipeEnd::ClientError(e)),
                 }
-                if forward_client_messages(&mut client_buf, server).await? {
-                    debug!(conn_id, "client sent Terminate — preserving upstream");
-                    return Ok(());
+                match forward_client_messages(
+                    &mut client_buf,
+                    server,
+                    &mut sync_points_sent,
+                    &mut framing_lost,
+                )
+                .await
+                {
+                    Ok(true) => {
+                        debug!(conn_id, "client sent Terminate — preserving upstream");
+                        finish!(PipeEnd::ClientClosed);
+                    }
+                    Ok(false) => {}
+                    Err(e) => finish!(PipeEnd::UpstreamError(e)),
                 }
                 deadline.as_mut().reset(Instant::now() + idle_timeout);
             }
             result = server.read_buf(&mut server_buf) => {
-                let n = result?;
-                if n == 0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "upstream closed unexpectedly",
-                    ));
+                match result {
+                    Ok(0) => finish!(PipeEnd::UpstreamClosed),
+                    Ok(_) => {}
+                    Err(e) => finish!(PipeEnd::UpstreamError(e)),
                 }
-                client.write_all(&server_buf).await?;
+                // Account for what upstream sent before forwarding it: the
+                // server's state has advanced whether or not the client is there.
+                rfq_received += tracker.feed(&server_buf);
+                let written = client.write_all(&server_buf).await;
                 server_buf.clear();
+                if let Err(e) = written {
+                    finish!(PipeEnd::ClientError(e));
+                }
                 deadline.as_mut().reset(Instant::now() + idle_timeout);
             }
             _ = &mut deadline, if query_timeout.is_some() => {
                 warn!(conn_id, "query timeout (pooled)");
                 Metrics::inc(&metrics.tenant_timeouts);
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "tenant query timeout",
-                ));
+                finish!(PipeEnd::Timeout);
             }
         }
     }
@@ -210,11 +299,15 @@ async fn pipe_pooled(
 
 /// Forward complete frontend messages to server, stopping on Terminate ('X').
 ///
-/// Returns `true` if Terminate was found (caller should stop piping).
-/// Leaves incomplete messages in the buffer for the next read.
+/// Counts the messages that each owe one ReadyForQuery — Query ('Q'), Sync
+/// ('S'), FunctionCall ('F') — in `sync_points`. Returns `true` if Terminate
+/// was found (caller should stop piping). Leaves incomplete messages in the
+/// buffer for the next read.
 async fn forward_client_messages(
     buf: &mut BytesMut,
     server: &mut UpstreamStream,
+    sync_points: &mut u64,
+    framing_lost: &mut bool,
 ) -> std::io::Result<bool> {
     loop {
         if buf.len() < 5 {
@@ -224,7 +317,9 @@ async fn forward_client_messages(
         let msg_type = buf[0];
         let length = i32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
         if length < 4 {
-            // Malformed framing — forward everything, let upstream handle it
+            // Malformed framing — forward everything, let upstream handle it.
+            // Upstream's state is unknown from here on; the pool will discard.
+            *framing_lost = true;
             server.write_all(buf).await?;
             buf.clear();
             return Ok(false);
@@ -241,6 +336,9 @@ async fn forward_client_messages(
             return Ok(true);
         }
 
+        if matches!(msg_type, b'Q' | b'S' | b'F') {
+            *sync_points += 1;
+        }
         server.write_all(&buf[..total]).await?;
         buf.advance(total);
     }
@@ -588,6 +686,8 @@ async fn handle_pooled(
         }
     };
 
+    // From here on the slot is leased: any early return releases it.
+    let lease = PoolLease::new(Arc::clone(pool), key);
     let mut server = pooled.stream;
     let mut server_buf = BytesMut::with_capacity(4096);
 
@@ -707,8 +807,8 @@ async fn handle_pooled(
     Ok((
         HandshakeResult::Pooled {
             stream: server,
-            key,
-            pool: Arc::clone(pool),
+            lease,
+            leftover: server_buf,
         },
         None,
     ))

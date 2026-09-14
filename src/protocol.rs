@@ -274,6 +274,66 @@ pub fn try_read_backend_message(buf: &mut BytesMut) -> Option<BackendMessage> {
     })
 }
 
+/// Tracks backend message boundaries across arbitrary byte chunks.
+///
+/// The pooled pipe forwards upstream bytes as they arrive, without buffering
+/// whole messages. This tracker walks the same bytes to count ReadyForQuery
+/// messages so the pool knows, at checkin, whether the upstream still owes a
+/// response to a request the departed client sent.
+#[derive(Debug, Default)]
+pub struct BackendFrameTracker {
+    header: [u8; 5],
+    header_len: usize,
+    /// Bytes remaining in the body of the message currently being read.
+    remaining: usize,
+}
+
+impl BackendFrameTracker {
+    /// Feed a chunk of upstream bytes. Returns the number of ReadyForQuery
+    /// message headers seen in it.
+    pub fn feed(&mut self, mut chunk: &[u8]) -> u64 {
+        let mut ready = 0;
+        while !chunk.is_empty() {
+            if self.remaining > 0 {
+                let n = self.remaining.min(chunk.len());
+                self.remaining -= n;
+                chunk = &chunk[n..];
+                continue;
+            }
+            let need = 5 - self.header_len;
+            let n = need.min(chunk.len());
+            self.header[self.header_len..self.header_len + n].copy_from_slice(&chunk[..n]);
+            self.header_len += n;
+            chunk = &chunk[n..];
+            if self.header_len == 5 {
+                let msg_type = self.header[0];
+                let length = i32::from_be_bytes([
+                    self.header[1],
+                    self.header[2],
+                    self.header[3],
+                    self.header[4],
+                ]);
+                self.header_len = 0;
+                // Length counts itself; a value below 4 is malformed — treat as empty body.
+                self.remaining = if length >= 4 {
+                    (length - 4) as usize
+                } else {
+                    0
+                };
+                if msg_type == backend::READY_FOR_QUERY {
+                    ready += 1;
+                }
+            }
+        }
+        ready
+    }
+
+    /// True if the last chunk ended inside a message (header or body).
+    pub fn mid_message(&self) -> bool {
+        self.header_len > 0 || self.remaining > 0
+    }
+}
+
 // ─── Building ───────────────────────────────────────────────────────────────
 
 /// Build a StartupMessage with the given parameters.
@@ -804,5 +864,80 @@ mod tests {
         assert!(m2.is_auth_ok());
 
         assert!(buf.is_empty());
+    }
+
+    // ─── BackendFrameTracker ─────────────────────────────────────────────
+
+    fn ready_for_query() -> BytesMut {
+        build_raw_backend_message(backend::READY_FOR_QUERY, b"I")
+    }
+
+    fn command_complete(tag: &str) -> BytesMut {
+        let mut payload = BytesMut::new();
+        payload.put_slice(tag.as_bytes());
+        payload.put_u8(0);
+        build_raw_backend_message(backend::COMMAND_COMPLETE, &payload)
+    }
+
+    #[test]
+    fn tracker_counts_ready_for_query_in_one_chunk() {
+        let mut t = BackendFrameTracker::default();
+        let mut chunk = BytesMut::new();
+        chunk.extend_from_slice(&command_complete("SET"));
+        chunk.extend_from_slice(&ready_for_query());
+        chunk.extend_from_slice(&command_complete("ROLLBACK"));
+        chunk.extend_from_slice(&ready_for_query());
+        assert_eq!(t.feed(&chunk), 2);
+        assert!(!t.mid_message());
+    }
+
+    #[test]
+    fn tracker_handles_header_split_across_chunks() {
+        let mut t = BackendFrameTracker::default();
+        let msg = ready_for_query(); // Z, len 5, 'I'
+        assert_eq!(t.feed(&msg[..1]), 0);
+        assert!(t.mid_message());
+        assert_eq!(t.feed(&msg[1..4]), 0);
+        assert!(t.mid_message());
+        // Header completes here; body byte still outstanding.
+        assert_eq!(t.feed(&msg[4..5]), 1);
+        assert!(t.mid_message());
+        assert_eq!(t.feed(&msg[5..]), 0);
+        assert!(!t.mid_message());
+    }
+
+    #[test]
+    fn tracker_handles_body_split_across_chunks() {
+        let mut t = BackendFrameTracker::default();
+        let body = vec![0xABu8; 300];
+        let row = build_raw_backend_message(backend::DATA_ROW, &body);
+        assert_eq!(t.feed(&row[..100]), 0);
+        assert!(t.mid_message());
+        assert_eq!(t.feed(&row[100..250]), 0);
+        assert!(t.mid_message());
+        let mut tail = BytesMut::from(&row[250..]);
+        tail.extend_from_slice(&ready_for_query());
+        assert_eq!(t.feed(&tail), 1);
+        assert!(!t.mid_message());
+    }
+
+    #[test]
+    fn tracker_does_not_count_ready_for_query_bytes_inside_a_body() {
+        // A DataRow whose payload happens to contain a 'Z' byte must not count.
+        let mut t = BackendFrameTracker::default();
+        let mut body = BytesMut::new();
+        body.extend_from_slice(&ready_for_query());
+        let row = build_raw_backend_message(backend::DATA_ROW, &body);
+        assert_eq!(t.feed(&row), 0);
+        assert!(!t.mid_message());
+    }
+
+    #[test]
+    fn tracker_tolerates_malformed_length() {
+        let mut t = BackendFrameTracker::default();
+        // Length 0 is malformed; treat as an empty body and keep going.
+        let chunk = [b'Z', 0, 0, 0, 0, b'Z', 0, 0, 0, 5, b'I'];
+        assert_eq!(t.feed(&chunk), 2);
+        assert!(!t.mid_message());
     }
 }
