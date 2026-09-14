@@ -48,6 +48,18 @@ Fix: 1.0.3 (issue #11) — the pooled pipe counts `Query`/`Sync`/`FunctionCall`
 against `ReadyForQuery`; checkin drains what is outstanding before reset;
 anything unaccountable is discarded.
 
+The client-visible poison had (at least) three manifestations, all of which
+`tests/drizzle/pool-desync.mjs` (7P.4) must catch: (1) a stray
+`CommandComplete` raised as a pg client `'error'` event; (2) a silent shifted
+or empty result with no error at all; (3) a stray `RowDescription` arriving on
+a client whose `activeQuery` is `null`, which makes pg's
+`Client._handleRowDescription` **throw uncaught** rather than emit `'error'`,
+so an app-side checkout `'error'` guard never sees it. A verifier confirmed
+manifestation 3 on 1.0.2. The harness traps it with a process-level
+`uncaughtException`/`unhandledRejection` handler that records a `crash` and
+exits non-zero, so a RowDescription-shift is asserted rather than aborting the
+run opaquely; all three are gone on 1.0.3.
+
 | Scenario | Coverage | Tests | Mutant |
 |---|---|---|---|
 | abrupt disconnect mid simple query | have | 2.5, 2.6, 7P.4 | remove the drain step (1.0.2 behaviour) |

@@ -4,11 +4,21 @@
 // running one query, while (in "poison" mode) a client periodically sends a
 // slow query and destroys its socket before the response arrives. Before the
 // fix, the abandoned response stayed on the shared upstream connection and the
-// next holder saw it: either "Received unexpected commandComplete message from
-// backend" or, worse, its own query resolving with an empty, shifted result.
+// next holder saw it. That poison had (at least) three manifestations, all of
+// which this harness must catch:
+//   1. "Received unexpected commandComplete message from backend" — a stray
+//      CommandComplete emitted as a pg client 'error' event.
+//   2. A silent, shifted/empty result: the client's own query resolves with
+//      the wrong or no rows and no error at all (the data-integrity hazard).
+//   3. A stray RowDescription landing on a client whose activeQuery is null:
+//      pg's Client._handleRowDescription null-dereferences and THROWS, an
+//      uncaught exception rather than an 'error' event — so an app-side
+//      checkout 'error' guard never sees it. This is caught below by a
+//      process-level uncaughtException/unhandledRejection trap, so the
+//      RowDescription-shifted manifestation is asserted, not just crashed on.
 //
 // Exit 0: every query on every fresh holder returned exactly its own result.
-// Exit 2: a protocol error or a shifted/empty result was observed.
+// Exit 2: a protocol error, a shifted/empty result, or a client crash was seen.
 //
 // Env: PGVPD_HOST, PGVPD_PORT, PG_DB, PG_PASS (pool password), ROUNDS,
 //      TENANT_POOLS, CONC, POISON_EVERY.  Arg: "poison" (default) or "clean".
@@ -34,13 +44,33 @@ const CONC = +(process.env.CONC || 8);
 // make a silent pass on a broken build vanishingly unlikely.
 const POISON_EVERY = +(process.env.POISON_EVERY || 5);
 
-const stats = { ok: 0, shifted: 0, protocol: 0, other: 0, dropsInjected: 0, samples: [] };
+const stats = { ok: 0, shifted: 0, protocol: 0, crash: 0, other: 0, dropsInjected: 0, samples: [] };
 const PROTOCOL_RE = /unexpected \w+ message from backend/i;
+// pg's Client._handleRowDescription does `this.activeQuery.handleRowDescription(...)`;
+// a stray RowDescription with activeQuery === null throws this shape.
+const ROWDESC_CRASH_RE = /Cannot read propert.*of null|handleRowDescription|activeQuery/i;
 
 function record(kind, message, extra = {}) {
   stats[kind]++;
-  if (stats.samples.length < 10) stats.samples.push({ kind, ...extra, message });
+  if (stats.samples.length < 12) stats.samples.push({ kind, ...extra, message });
 }
+
+// Manifestation 3: the stray-RowDescription null-deref throws uncaught rather
+// than emitting 'error', so no client/pool listener catches it. Trap it at the
+// process level, record it as a hard failure, print the summary, and exit 2 —
+// the process state is undefined after an uncaughtException, so we cannot
+// continue the run, but we must not exit 0 or crash opaquely.
+function fatalCrash(label, err) {
+  const message = String((err && err.stack) || (err && err.message) || err);
+  const isRowDesc = ROWDESC_CRASH_RE.test(message);
+  record('crash', `${label}${isRowDesc ? ' (RowDescription-shift null-deref)' : ''}: ${message.split('\n')[0]}`);
+  try {
+    console.log(JSON.stringify({ mode, crashed: true, ...stats }, null, 2));
+  } catch { /* ignore */ }
+  process.exit(2);
+}
+process.on('uncaughtException', (err) => fatalCrash('uncaughtException', err));
+process.on('unhandledRejection', (err) => fatalCrash('unhandledRejection', err));
 
 const tenants = Array.from({ length: TENANT_POOLS }, (_, i) => (i % 2 ? 'tenant_b' : 'tenant_a'));
 const pools = tenants.map((tenant) => {
@@ -110,4 +140,4 @@ await Promise.all(pools.map((pool) => pool.end()));
 
 const seconds = ((Date.now() - started) / 1000).toFixed(1);
 console.log(JSON.stringify({ mode, rounds: ROUNDS, conc: CONC, tenantPools: TENANT_POOLS, seconds, ...stats }, null, 2));
-process.exit(stats.protocol + stats.shifted > 0 ? 2 : 0);
+process.exit(stats.protocol + stats.shifted + stats.crash > 0 ? 2 : 0);
