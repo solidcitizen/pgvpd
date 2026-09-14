@@ -44,9 +44,11 @@ Consequences:
 - Do not expose the proxy port through a load balancer to the internet, even
   with TLS. TLS protects the wire, not the assertion.
 - The admin API (`admin_port`) currently binds all interfaces and has no
-  authentication (issue #13). `/status` reveals database names, roles and pool
-  occupancy; `/metrics` reveals per-tenant rejection counts. Until the bind
-  default and token land, restrict the admin port with a host firewall.
+  authentication (issue #13). The exposure is `/status`, which reveals database
+  names, roles and pool occupancy. `/metrics` carries only aggregate counters,
+  including rejections grouped by reason (`reason="deny|limit|rate"`) — no
+  tenant identifiers or row data. Until the bind default and token land,
+  restrict the admin port with a host firewall.
 
 ## What an attacker can do
 
@@ -68,6 +70,33 @@ Consequences:
 - A pooled connection whose protocol state cannot be verified at checkin is
   closed, never reused.
 - Empty context values are injected as `''`, which matches nothing.
+
+## Session state does not survive a pooled hand-off
+
+In pool mode a single upstream connection is reused across many client
+sessions. `DISCARD ALL` at checkin (and checkout) clears all session-lifetime
+state — temporary tables, prepared statements, session GUCs, `search_path`,
+`SET ROLE`, cursors, `LISTEN` registrations, and **session-level advisory
+locks** (`DISCARD ALL` runs `pg_advisory_unlock_all()`). This is correct and
+required for isolation, but it has a consequence callers must respect:
+
+- **Do not rely on session-lifetime state across requests through a pooled
+  connection.** Anything a client sets on one checkout is gone on the next.
+- **Session-level advisory locks must not be taken through pooled sessions.**
+  A lock a client holds is released the moment its session is handed back, and
+  a different tenant checking out the same backend can immediately acquire the
+  same lock id. A verifier confirmed this: a rival tenant took the same lock
+  one second later on the same backend pid. Code that needs a lock to outlive
+  a single query — coordination leases, drain ownership — must use a direct,
+  non-pooled connection (or transaction-level locks held within one
+  transaction). Transaction-scoped advisory locks are safe because they are
+  released at transaction end, before hand-off.
+
+An in-flight query keeps its own session locks until it finishes, even after
+the client disconnects, because Postgres runs the query to completion. A
+client that abandons a slow locking query can therefore orphan a lock for the
+duration of that query. Mitigation is tracked separately (see the issue
+register); operators can bound it with `tenant_query_timeout`.
 
 ## Out of scope
 
