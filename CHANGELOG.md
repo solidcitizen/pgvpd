@@ -2,6 +2,26 @@
 
 All notable changes to pgvpd are documented here.
 
+## [1.0.5] — 2026-09-18
+
+### Fixed
+- Logging was on the connection data path: pgvpd logged to stdout via
+  `tracing_subscriber::fmt`, and a per-connection `info!` wrote directly on the
+  connection task. When a parent process closed BOTH pgvpd's stdout and stderr
+  while pgvpd kept running (e.g. a launcher that exited right after spawn, or a
+  supervisor that stopped draining), the stdout write failed, tracing's error
+  fallback `eprintln!`'d to the now-closed stderr, and `eprintln!` panicked on
+  the write error — killing the per-connection task before it decremented
+  `connections_active` or completed checkout. Every later connection was then
+  accepted and dropped (`Connection terminated unexpectedly`),
+  `connections_active` climbed and never fell, and checkouts froze: a permanent
+  wedge (TCP still accepting, process alive) cleared only by restart. Logging
+  now goes through a non-blocking writer (`tracing_appender::non_blocking`, a
+  bounded channel drained by a worker thread, dropping lines when full), so a
+  slow or closed consumer can neither block nor panic a connection task. The
+  startup banner and the fatal-error line use non-panicking writes.
+  Pre-existing (1.0.0–1.0.4). (#21)
+
 ## [1.0.4] — 2026-09-14
 
 ### Fixed
