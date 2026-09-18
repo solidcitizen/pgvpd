@@ -12,6 +12,7 @@
 //
 // Env: PGVPD_BIN (required), PGVPD_HOST/PGVPD_PORT for the upstream, PG_DB/PG_PASS.
 import { spawn } from 'node:child_process';
+import net from 'node:net';
 import pg from 'pg';
 
 const BIN = process.env.PGVPD_BIN;
@@ -34,6 +35,27 @@ const child = spawn(BIN, [], { env: { ...process.env,
   stdio: ['ignore', 'pipe', 'pipe'] });
 child.stdout.on('data', () => {}); child.stderr.on('data', () => {});
 
+// Wait until the proxy is actually accepting TCP (a fixed sleep is flaky on
+// slow/cold CI runners — the spawned pgvpd may not have bound the port yet).
+function portOpen(port) {
+  return new Promise((resolve) => {
+    const s = new net.Socket();
+    s.setTimeout(1000);
+    s.once('connect', () => { s.destroy(); resolve(true); });
+    s.once('timeout', () => { s.destroy(); resolve(false); });
+    s.once('error', () => { s.destroy(); resolve(false); });
+    s.connect(port, '127.0.0.1');
+  });
+}
+async function waitForProxy(deadlineMs) {
+  const end = Date.now() + deadlineMs;
+  while (Date.now() < end) {
+    if (child.exitCode !== null) return false; // pgvpd died
+    if (await portOpen(PROXY)) return true;
+    await sleep(200);
+  }
+  return false;
+}
 async function activeCount() {
   try { const j = await (await fetch(`http://127.0.0.1:${ADMIN}/status`)).json(); return j.connections_active; }
   catch { return -1; }
@@ -51,18 +73,24 @@ async function probe(n) {
 
 let code = 0;
 try {
-  await sleep(1000);
+  if (!(await waitForProxy(20000))) { console.log('SETUP FAIL: proxy never came up on', PROXY); child.kill('SIGKILL'); process.exit(3); }
+  // Give post-listen startup a beat to settle.
+  await sleep(300);
   const before = await probe(2);
-  if (before.some((r) => r !== 'ok')) { console.log('SETUP FAIL before pipe close:', before); process.exitCode = 3; child.kill('SIGKILL'); process.exit(3); }
+  if (before.some((r) => r !== 'ok')) { console.log('SETUP FAIL before pipe close:', before); child.kill('SIGKILL'); process.exit(3); }
 
   child.stdout.destroy();
   child.stderr.destroy();
   await sleep(200);
 
   const after = [...await probe(6), ...(await sleep(400), await probe(3))];
+  await sleep(500); // let the just-closed connections settle before reading active
   const active = await activeCount();
   const allOk = after.every((r) => r === 'ok');
-  const leaked = active > 1; // healthy: returns to ~0; wedged: climbs and stays
+  // Healthy: active settles back to ~0 (a connection mid-close may briefly show
+  // 1-2). Wedged: every accepted-then-dropped task leaks, so active tracks the
+  // number of post-close attempts (9 here) and never falls.
+  const leaked = active > 4;
   console.log(JSON.stringify({ before, afterPipeClose: after, connections_active: active, allOk, leaked, childAlive: child.exitCode === null }, null, 2));
   if (!allOk || leaked) code = 2;
 } finally {
