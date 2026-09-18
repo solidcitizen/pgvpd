@@ -20,13 +20,15 @@ if (!BIN) { console.error('PGVPD_BIN required'); process.exit(3); }
 // Dedicated ports so this suite never races another suite's pgvpd on port
 // release (a bind conflict would make the spawned pgvpd exit before binding).
 const PROXY = +(process.env.WEDGE_PROXY_PORT || 16442), ADMIN = +(process.env.WEDGE_ADMIN_PORT || 16443);
-const UP_HOST = process.env.PGVPD_HOST || '127.0.0.1';
-const UP_PORT = process.env.PGVPD_PORT || '15432';
+let UP_HOST = process.env.WEDGE_UP_HOST || '127.0.0.1';
+if (UP_HOST === 'localhost') UP_HOST = '127.0.0.1'; // avoid IPv6 ::1 vs IPv4 mismatch
+const UP_PORT = process.env.WEDGE_UP_PORT || '15432';
 const DB = process.env.PG_DB || 'pgvpd_test';
 const PASS = process.env.PG_PASS || 'testpass';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const child = spawn(BIN, [], { env: { ...process.env,
+  PGVPD_HOST: '127.0.0.1', // listen host — do not inherit a colliding PGVPD_HOST
   PGVPD_PORT: String(PROXY), PGVPD_ADMIN_PORT: String(ADMIN),
   PGVPD_UPSTREAM_HOST: UP_HOST, PGVPD_UPSTREAM_PORT: String(UP_PORT),
   PGVPD_CONTEXT_VARIABLES: 'app.current_tenant_id', PGVPD_TENANT_SEPARATOR: '.',

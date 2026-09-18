@@ -785,7 +785,7 @@ else
     *)  LOG_WEDGE_BIN="$(pwd)/$PGVPD_BIN" ;;
   esac
   log_wedge_result=0
-  (cd tests/drizzle && PGVPD_BIN="$LOG_WEDGE_BIN" PGVPD_HOST=$PG_HOST PGVPD_PORT=$PG_PORT PG_DB=$PG_DB PG_PASS=$PG_PASS node log-wedge.mjs) || log_wedge_result=$?
+  (cd tests/drizzle && PGVPD_BIN="$LOG_WEDGE_BIN" WEDGE_UP_HOST=$PG_HOST WEDGE_UP_PORT=$PG_PORT PG_DB=$PG_DB PG_PASS=$PG_PASS node log-wedge.mjs) || log_wedge_result=$?
   if [ $log_wedge_result -eq 0 ]; then
     pass "10.1 Logging wedge — connections survive parent closing both stdio pipes"
   else
