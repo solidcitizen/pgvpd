@@ -17,7 +17,9 @@ import pg from 'pg';
 
 const BIN = process.env.PGVPD_BIN;
 if (!BIN) { console.error('PGVPD_BIN required'); process.exit(3); }
-const PROXY = 16432, ADMIN = 16433;
+// Dedicated ports so this suite never races another suite's pgvpd on port
+// release (a bind conflict would make the spawned pgvpd exit before binding).
+const PROXY = +(process.env.WEDGE_PROXY_PORT || 16442), ADMIN = +(process.env.WEDGE_ADMIN_PORT || 16443);
 const UP_HOST = process.env.PGVPD_HOST || '127.0.0.1';
 const UP_PORT = process.env.PGVPD_PORT || '15432';
 const DB = process.env.PG_DB || 'pgvpd_test';
@@ -33,7 +35,10 @@ const child = spawn(BIN, [], { env: { ...process.env,
   PGVPD_POOL_PASSWORD: PASS, PGVPD_UPSTREAM_PASSWORD: PASS,
   PGVPD_POOL_IDLE_TIMEOUT: '300', PGVPD_POOL_CHECKOUT_TIMEOUT: '5' },
   stdio: ['ignore', 'pipe', 'pipe'] });
-child.stdout.on('data', () => {}); child.stderr.on('data', () => {});
+let childErr = '';
+child.on('error', (e) => { childErr += 'spawn error: ' + e.message + '\n'; });
+child.stdout.on('data', () => {});
+child.stderr.on('data', (d) => { if (childErr.length < 2000) childErr += d.toString(); });
 
 // Wait until the proxy is actually accepting TCP (a fixed sleep is flaky on
 // slow/cold CI runners — the spawned pgvpd may not have bound the port yet).
@@ -73,7 +78,7 @@ async function probe(n) {
 
 let code = 0;
 try {
-  if (!(await waitForProxy(20000))) { console.log('SETUP FAIL: proxy never came up on', PROXY); child.kill('SIGKILL'); process.exit(3); }
+  if (!(await waitForProxy(20000))) { console.log('SETUP FAIL: proxy never came up on', PROXY, '| childExit=', child.exitCode, 'signal=', child.signalCode, '| BIN=', BIN, '| childErr:', childErr.slice(0,500)); child.kill('SIGKILL'); process.exit(3); }
   // Give post-listen startup a beat to settle.
   await sleep(300);
   const before = await probe(2);
