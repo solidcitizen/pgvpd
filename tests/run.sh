@@ -703,6 +703,66 @@ fi
 stop_pgvpd
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Suite 9: Slot-leak on cancelled checkout (issue #20)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Point pgvpd at a black-hole upstream that accepts TCP but never responds, so
+# every create_connection outlives the 2s handshake timeout and its checkout is
+# cancelled mid-reservation. A correct pool releases each reserved slot; the
+# pre-fix pool leaked them, pinning bucket.total at pool_size and wedging the
+# pool. After several cancelled checkouts, bucket.total must be back to 0.
+
+if ! command -v node &>/dev/null; then
+  echo ""
+  echo "═══ Suite 9: Slot-leak (SKIPPED — node not found) ═══"
+else
+  echo ""
+  echo "═══ Suite 9: Slot-leak on cancelled checkout ═══"
+
+  node tests/blackhole.mjs 15999 > /tmp/pgvpd-blackhole.log 2>&1 &
+  BLACKHOLE_PID=$!
+  # Wait for the black hole to listen.
+  for _ in $(seq 1 30); do nc -z 127.0.0.1 15999 2>/dev/null && break; sleep 0.1; done
+
+  start_pgvpd tests/pgvpd-leak-test.conf
+
+  # Five checkout attempts; each hangs on the black hole and is cancelled by the
+  # 2s handshake timeout. pool_size is 3, so a leak pins total at 3.
+  for _ in 1 2 3 4 5; do
+    PGPASSWORD="$PG_PASS" psql -h $PG_HOST -p $PGVPD_PORT -U "app_user.tenant_a" -d $PG_DB \
+      -t -A --no-psqlrc -c "SELECT 1" > /dev/null 2>&1 || true
+  done
+
+  # Read bucket total from the admin /status; a leak leaves it at pool_size.
+  status_json=$(curl -fsS "http://127.0.0.1:16433/status" 2>/dev/null || echo '{}')
+  max_total=$(printf '%s' "$status_json" \
+    | grep -oE '"total"[[:space:]]*:[[:space:]]*[0-9]+' \
+    | grep -oE '[0-9]+$' | sort -rn | head -1)
+  max_total=${max_total:-0}
+
+  if [ "$max_total" = "0" ]; then
+    pass "9.1 Slot-leak — reserved slots released after cancelled checkouts (total=0)"
+  else
+    fail "9.1 Slot-leak — leaked reserved slots (bucket total=$max_total, expected 0)"
+  fi
+
+  # The pool must still serve: a fresh checkout is not wedged by the cancels.
+  # (It also fails against the black hole, but with a handshake timeout, not a
+  # 'pool checkout timeout: all connections in use'.)
+  result=$(PGPASSWORD="$PG_PASS" psql -h $PG_HOST -p $PGVPD_PORT -U "app_user.tenant_a" -d $PG_DB \
+    -t -A --no-psqlrc -c "SELECT 1" 2>&1 || true)
+  if echo "$result" | grep -qi "all connections in use"; then
+    fail "9.2 Slot-leak — pool wedged (checkout timeout: all connections in use)"
+  else
+    pass "9.2 Slot-leak — pool not wedged after cancelled checkouts"
+  fi
+
+  stop_pgvpd
+  kill "$BLACKHOLE_PID" 2>/dev/null || true
+  wait "$BLACKHOLE_PID" 2>/dev/null || true
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Summary
 # ═══════════════════════════════════════════════════════════════════════════
 
