@@ -1,6 +1,6 @@
 [package]
 name = "pgvpd"
-version = "1.0.4"
+version = "1.0.5"
 edition = "2024"
 description = "Virtual Private Database for PostgreSQL — tenant isolation at the connection level"
 license = "MIT"
@@ -16,6 +16,7 @@ bytes = "1"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 tokio-rustls = "0.26"
 rustls = "0.23"
 rustls-pemfile = "2"

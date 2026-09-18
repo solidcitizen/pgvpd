@@ -763,6 +763,37 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Suite 10: Logging must not wedge the proxy (issue #21)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# The harness spawns its OWN pgvpd with piped stdout+stderr (as a parent that
+# re-emits pgvpd's logs would), warms up, then destroys both pipes while pgvpd
+# keeps running. Before the fix, the next per-connection log write panicked the
+# task and permanently wedged the pool. It must not now.
+
+if ! command -v node &>/dev/null; then
+  echo ""
+  echo "═══ Suite 10: Logging wedge (SKIPPED — node not found) ═══"
+else
+  echo ""
+  echo "═══ Suite 10: Logging must not wedge the proxy ═══"
+
+  # The harness spawns the binary from tests/drizzle, so resolve it absolutely
+  # (PGVPD_BIN may be relative to the repo root or an absolute override).
+  case "$PGVPD_BIN" in
+    /*) LOG_WEDGE_BIN="$PGVPD_BIN" ;;
+    *)  LOG_WEDGE_BIN="$(pwd)/$PGVPD_BIN" ;;
+  esac
+  log_wedge_result=0
+  (cd tests/drizzle && PGVPD_BIN="$LOG_WEDGE_BIN" PGVPD_HOST=$PG_HOST PGVPD_PORT=$PG_PORT PG_DB=$PG_DB PG_PASS=$PG_PASS node log-wedge.mjs) || log_wedge_result=$?
+  if [ $log_wedge_result -eq 0 ]; then
+    pass "10.1 Logging wedge — connections survive parent closing both stdio pipes"
+  else
+    fail "10.1 Logging wedge — proxy wedged after stdio pipes closed (exit $log_wedge_result)"
+  fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Summary
 # ═══════════════════════════════════════════════════════════════════════════
 
