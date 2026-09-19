@@ -642,7 +642,7 @@ mod tests {
         payload.extend_from_slice(&(-1i32).to_be_bytes()); // NULL
         let cols = vec!["org_id".to_string()];
         let row = parse_data_row(&payload, &cols);
-        assert!(row.get("org_id").is_none());
+        assert!(!row.contains_key("org_id"));
     }
 
     #[test]

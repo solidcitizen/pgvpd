@@ -10,6 +10,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info};
 
 use crate::admin::{self, AdminState};
+use crate::cancel::CancelRegistry;
 use crate::config::{Config, PoolMode};
 use crate::connection;
 use crate::metrics::Metrics;
@@ -65,6 +66,9 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // ─── Metrics ─────────────────────────────────────────────────────────
 
     let metrics = Arc::new(Metrics::new(resolver_names));
+
+    // Routes client CancelRequests to the right upstream connection (pool mode).
+    let cancel_registry = Arc::new(CancelRegistry::new());
 
     // Now load resolvers for real (with metrics)
     let resolver_engine: Option<Arc<ResolverEngine>> = match &config.resolvers {
@@ -178,7 +182,11 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             pool: pool.clone(),
             resolver: resolver_engine.clone(),
         };
-        tokio::spawn(admin::serve(admin_state, admin_port));
+        tokio::spawn(admin::serve(
+            admin_state,
+            config.admin_host.clone(),
+            admin_port,
+        ));
     }
 
     // ─── TLS listener (if configured) ───────────────────────────────────
@@ -194,6 +202,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         let tls_resolver = resolver_engine.clone();
         let tls_metrics = Arc::clone(&metrics);
         let tls_tenant = tenant_registry.clone();
+        let tls_cancel = Arc::clone(&cancel_registry);
 
         tokio::spawn(async move {
             loop {
@@ -204,6 +213,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                         let pool = tls_pool.clone();
                         let resolver = tls_resolver.clone();
                         let tenant = tls_tenant.clone();
+                        let cancel = Arc::clone(&tls_cancel);
                         let acceptor = acceptor.clone();
                         let m = Arc::clone(&tls_metrics);
                         let conn_id = CONN_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
@@ -221,6 +231,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                                         pool,
                                         resolver,
                                         tenant,
+                                        cancel,
                                         Arc::clone(&m),
                                         conn_id,
                                     )
@@ -250,6 +261,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         let pool = pool.clone();
         let resolver = resolver_engine.clone();
         let tenant = tenant_registry.clone();
+        let cancel = Arc::clone(&cancel_registry);
         let m = Arc::clone(&metrics);
         let conn_id = CONN_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
 
@@ -264,6 +276,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 pool,
                 resolver,
                 tenant,
+                cancel,
                 Arc::clone(&m),
                 conn_id,
             )

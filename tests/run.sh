@@ -794,6 +794,146 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Suite 11: Handshake EOF must not busy-spin (issue #24)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# A client that connects and closes during the handshake must not spin its
+# connection task at 100% CPU until the handshake timeout. The harness spawns
+# its own pgvpd (no upstream needed — the close happens during the startup read)
+# with a 1s handshake timeout, fires a burst of connect-and-close events, and
+# asserts no per-connection "handshake timeout" is logged and the proxy still
+# accepts. Before the fix every handshake-phase read loop ignored EOF (Ok(0)).
+
+if ! command -v node &>/dev/null; then
+  echo ""
+  echo "═══ Suite 11: Handshake EOF spin (SKIPPED — node not found) ═══"
+else
+  echo ""
+  echo "═══ Suite 11: Handshake EOF must not busy-spin ═══"
+  case "$PGVPD_BIN" in
+    /*) EOF_BIN="$PGVPD_BIN" ;;
+    *)  EOF_BIN="$(pwd)/$PGVPD_BIN" ;;
+  esac
+  eof_result=0
+  PGVPD_BIN="$EOF_BIN" node tests/eof-storm.mjs || eof_result=$?
+  if [ $eof_result -eq 0 ]; then
+    pass "11.1 Handshake EOF — connect-and-close ends promptly, no spin (issue #24)"
+  else
+    fail "11.1 Handshake EOF — connect-and-close spun to handshake timeout (exit $eof_result)"
+  fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Suite 12: Admin API must not bind all interfaces by default (issue #13)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# /status and /metrics are unauthenticated and reveal pool topology, so the
+# admin API must default to 127.0.0.1 and only bind wider when PGVPD_ADMIN_HOST
+# is set. The harness spawns its own pgvpd (no upstream needed) and checks the
+# admin port is reachable on loopback but not on a non-loopback address by
+# default, and reachable off-host only with the opt-in.
+
+if ! command -v node &>/dev/null; then
+  echo ""
+  echo "═══ Suite 12: Admin bind (SKIPPED — node not found) ═══"
+else
+  echo ""
+  echo "═══ Suite 12: Admin API bind host ═══"
+  case "$PGVPD_BIN" in
+    /*) ADMIN_BIN="$PGVPD_BIN" ;;
+    *)  ADMIN_BIN="$(pwd)/$PGVPD_BIN" ;;
+  esac
+  admin_bind_result=0
+  PGVPD_BIN="$ADMIN_BIN" node tests/admin-bind.mjs || admin_bind_result=$?
+  if [ $admin_bind_result -eq 0 ]; then
+    pass "12.1 Admin bind — defaults to 127.0.0.1, opt-in exposes (issue #13)"
+  else
+    fail "12.1 Admin bind — default reachable off-host or opt-in ignored (exit $admin_bind_result)"
+  fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Suite 13: Dead upstream is discarded and retried, not surfaced (issue #15)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# A pooled connection whose upstream went away (restart/failover/terminated
+# backend) must not fail the next client. The harness warms the pool, kills
+# pgvpd's upstream backends directly in Postgres, then reconnects through the
+# proxy: checkouts that reuse the dead connections must recover on a fresh one.
+
+if ! command -v node &>/dev/null; then
+  echo ""
+  echo "═══ Suite 13: Upstream restart recovery (SKIPPED — node not found) ═══"
+else
+  echo ""
+  echo "═══ Suite 13: Dead upstream discard-and-retry ═══"
+  case "$PGVPD_BIN" in
+    /*) RESTART_BIN="$PGVPD_BIN" ;;
+    *)  RESTART_BIN="$(pwd)/$PGVPD_BIN" ;;
+  esac
+  restart_result=0
+  (cd tests/drizzle && PGVPD_BIN="$RESTART_BIN" UP_HOST=$PG_HOST UP_PORT=$PG_PORT PG_DB=$PG_DB PG_PASS=$PG_PASS node upstream-restart.mjs) || restart_result=$?
+  if [ $restart_result -eq 0 ]; then
+    pass "13.1 Upstream restart — dead pooled connection discarded and retried (issue #15)"
+  else
+    fail "13.1 Upstream restart — client victimized by dead pooled connection (exit $restart_result)"
+  fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Suite 14: Query cancel is routed and isolated (issue #12)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# A client's CancelRequest must cancel ONLY its own upstream query, never another
+# tenant's. Two tenants run concurrent sleeps on the same bucket; cancelling one
+# must abort it (57014) and leave the other running.
+
+if ! command -v node &>/dev/null; then
+  echo ""
+  echo "═══ Suite 14: Cancel isolation (SKIPPED — node not found) ═══"
+else
+  echo ""
+  echo "═══ Suite 14: Query cancel routing + isolation ═══"
+  case "$PGVPD_BIN" in
+    /*) CANCEL_BIN="$PGVPD_BIN" ;;
+    *)  CANCEL_BIN="$(pwd)/$PGVPD_BIN" ;;
+  esac
+  cancel_result=0
+  (cd tests/drizzle && PGVPD_BIN="$CANCEL_BIN" UP_HOST=$PG_HOST UP_PORT=$PG_PORT PG_DB=$PG_DB PG_PASS=$PG_PASS node cancel-isolation.mjs) || cancel_result=$?
+  if [ $cancel_result -eq 0 ]; then
+    pass "14.1 Cancel routing — cancels own query only, other tenant unaffected (issue #12)"
+  else
+    fail "14.1 Cancel routing — cancel misrouted or no-op (exit $cancel_result)"
+  fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Suite 15: Orphaned query is cancelled on client disconnect (issue #14)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# A client that drops mid-query must not leave its query running upstream: pgvpd
+# cancels the orphan at checkin instead of waiting out the drain.
+
+if ! command -v node &>/dev/null; then
+  echo ""
+  echo "═══ Suite 15: Orphan cancel (SKIPPED — node not found) ═══"
+else
+  echo ""
+  echo "═══ Suite 15: Orphaned query cancelled on disconnect ═══"
+  case "$PGVPD_BIN" in
+    /*) ORPHAN_BIN="$PGVPD_BIN" ;;
+    *)  ORPHAN_BIN="$(pwd)/$PGVPD_BIN" ;;
+  esac
+  orphan_result=0
+  (cd tests/drizzle && PGVPD_BIN="$ORPHAN_BIN" UP_HOST=$PG_HOST UP_PORT=$PG_PORT PG_DB=$PG_DB PG_PASS=$PG_PASS node orphan-cancel.mjs) || orphan_result=$?
+  if [ $orphan_result -eq 0 ]; then
+    pass "15.1 Orphan cancel — abandoned query cancelled upstream (issue #14)"
+  else
+    fail "15.1 Orphan cancel — abandoned query left running (exit $orphan_result)"
+  fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Summary
 # ═══════════════════════════════════════════════════════════════════════════
 

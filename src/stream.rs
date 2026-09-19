@@ -1,13 +1,40 @@
 //! Stream abstraction — plain TCP or TLS on both client and upstream sides.
 
+use bytes::BytesMut;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::server::TlsStream as ServerTlsStream;
+
+/// Read into `buf`, treating EOF (`read_buf` returning `Ok(0)`) as an error
+/// rather than "no data yet".
+///
+/// `read_buf` yields `Ok(0)` when the peer has closed its half of the socket.
+/// A handshake-phase loop reads, tries to parse a complete message, and loops
+/// when it has none yet. If such a loop calls `read_buf(...).await?` directly,
+/// an EOF returns `Ok(0)`, leaves the buffer unchanged, and the loop spins the
+/// task at 100% CPU until an outer timeout fires — the root cause of issue #24
+/// and its siblings across the startup, auth, reset, and inject paths. Routing
+/// every such loop through this helper turns a closed socket into a prompt,
+/// clean `UnexpectedEof`. The steady-state pipe (`pipe_pooled`) and the pool's
+/// `drain_outstanding` already handle `Ok(0)` inline; this is the same rule for
+/// the handshake side, in one place.
+pub async fn read_or_eof<S>(stream: &mut S, buf: &mut BytesMut) -> io::Result<usize>
+where
+    S: AsyncReadExt + Unpin,
+{
+    match stream.read_buf(buf).await {
+        Ok(0) => Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "peer closed connection during handshake",
+        )),
+        other => other,
+    }
+}
 
 // ─── Client-facing stream ───────────────────────────────────────────────────
 

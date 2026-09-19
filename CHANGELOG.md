@@ -2,6 +2,62 @@
 
 All notable changes to pgvpd are documented here.
 
+## [1.0.6] — 2026-09-18
+
+### Added
+- Pool mode: query cancellation now works and is tenant-isolated (#12). Each
+  client is handed pgvpd's OWN minted BackendKeyData instead of the bucket-shared
+  upstream key; a `CancelRequest` is routed through a registry to that client's
+  current upstream connection alone. Previously CancelRequest was dropped (a
+  no-op) and every client shared one cancel key, so a forwarded cancel could have
+  hit another tenant's query. A regression suite proves a cancel aborts only the
+  issuing client's query (57014) and leaves a concurrent tenant untouched.
+
+### Changed
+- Cleanup from NexusPlus's hostile round (#16): `pgvpd_pool_creates_total` now
+  counts successful connection creates only (it previously incremented before
+  `create_connection`, so a failed connect inflated it); a pooled-connection
+  reset that exceeds the timeout is now logged distinctly ("reset timed out")
+  from one that fails ("reset failed"); and the CI lint gate runs
+  `cargo clippy --all-targets -- -D warnings`, covering tests and benches, with
+  the pre-existing lint backlog cleared.
+
+### Fixed
+- Pool mode: a client that dropped an in-flight query left it running upstream
+  until the checkin drain timed out (up to 5s), pinning the pooled slot. pgvpd
+  now cancels the orphaned query at checkin (using the connection's real backend
+  key) so the slot is reclaimed promptly. (#14)
+- Pool mode: a pooled connection whose upstream had gone away (Postgres
+  restart, failover, or an administrator terminating the backend) failed the
+  next client that checked it out — the `DISCARD ALL` reset hit a dead socket or
+  a FATAL from the terminating backend and surfaced as a connection error. After
+  an upstream bounce, one client was victimized per stale pooled connection until
+  the bucket cleared. Checkout now discards a connection that fails its reset and
+  retries with a fresh one (bounded), so the client connects transparently; if
+  the upstream is genuinely down, `create_connection` fails and that error is
+  surfaced instead of looping. Pre-existing since pooling (0.3). (#15)
+- Admin API bound `0.0.0.0` unconditionally, exposing the unauthenticated
+  `/status` and `/metrics` endpoints — which reveal pool topology (every
+  `database`, `role`, and bucket count) — on every interface. On a multi-homed
+  host this leaked the tenant/role namespace to anything that could route to the
+  port. The admin API now binds `127.0.0.1` by default; set `admin_host`
+  (config), `--admin-host` (CLI), or `PGVPD_ADMIN_HOST` (env) to expose it
+  deliberately. Pre-existing since the admin API (0.5). (#13)
+- Handshake-phase read loops ignored EOF. `read_buf` returns `Ok(0)` when the
+  peer closes its socket; that is not an error, but the startup, upstream-auth
+  (cleartext/MD5/SCRAM), post-auth, pooled reset (`DISCARD ALL`), context
+  injection, pool-connection-create, and checkin-reset loops all treated `Ok(0)`
+  as "no data yet" and looped again. A client (or upstream) that closed mid-
+  handshake therefore returned `Ok(0)` immediately and forever, spinning the
+  connection task at ~100% CPU until the handshake timeout (30s) or reset timeout
+  (5s) fired. A connect-and-close storm pinned one spinning core per event and
+  logged a spurious per-connection "handshake timeout". Measured: 15 events with
+  a 1s handshake timeout burned ~8 CPU-seconds on 1.0.5, ~0 after the fix. Every
+  such loop now reads through a single `stream::read_or_eof` helper that maps
+  `Ok(0)` to a prompt `UnexpectedEof`, mirroring the steady-state pipe (which
+  already handled EOF since #11). Availability/CPU class, bounded by the loopback
+  trust model. Pre-existing (all versions). (#24)
+
 ## [1.0.5] — 2026-09-18
 
 ### Fixed

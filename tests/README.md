@@ -40,6 +40,11 @@ The script handles everything: starts Postgres in Docker, loads fixtures, builds
 | 9.1 | Pool | Cancelled checkout (black-hole upstream) | Reserved slot released; bucket total returns to 0 (issue #20) |
 | 9.2 | Pool | Not wedged after cancels | Fresh checkout is not blocked by leaked slots (issue #20) |
 | 10.1 | Logging | Parent closes both stdio pipes | Connections survive; logging never panics a task (issue #21) |
+| 11.1 | Handshake | Client connects and closes during handshake | Task ends promptly, no busy-spin to the handshake timeout (issue #24) |
+| 12.1 | Admin API | Default vs. opt-in bind host | Admin API defaults to 127.0.0.1, not reachable off-host; PGVPD_ADMIN_HOST opts in (issue #13) |
+| 13.1 | Pool | Upstream backends killed under the pool | Dead pooled connection discarded and checkout retried on a fresh one; client not victimized (issue #15) |
+| 14.1 | Pool | Two tenants, cancel one | Cancel routed to the issuing client's query only (57014); other tenant unaffected (issue #12) |
+| 15.1 | Pool | Client drops mid-query | Orphaned query cancelled upstream at checkin, not left running (issue #14) |
 
 ## Diagnostics
 
