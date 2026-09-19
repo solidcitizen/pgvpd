@@ -2,7 +2,7 @@
 
 All notable changes to pgvpd are documented here.
 
-## [Unreleased]
+## [1.0.6] — 2026-09-18
 
 ### Fixed
 - Pool mode: a pooled connection whose upstream had gone away (Postgres
