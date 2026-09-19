@@ -127,6 +127,10 @@ pub struct Cli {
     #[arg(long)]
     pub admin_port: Option<u16>,
 
+    /// Host/interface the admin API binds (default: 127.0.0.1)
+    #[arg(long)]
+    pub admin_host: Option<String>,
+
     /// Override SET ROLE target (default: use rewritten username)
     #[arg(long)]
     pub set_role: Option<String>,
@@ -178,6 +182,7 @@ pub struct Config {
     pub pool_checkout_timeout: u64,
     pub resolvers: Option<String>,
     pub admin_port: Option<u16>,
+    pub admin_host: String,
     pub set_role: Option<String>,
     pub tenant_allow: Option<Vec<String>>,
     pub tenant_deny: Option<Vec<String>>,
@@ -213,6 +218,7 @@ impl Default for Config {
             pool_checkout_timeout: 5,
             resolvers: None,
             admin_port: None,
+            admin_host: "127.0.0.1".into(),
             set_role: None,
             tenant_allow: None,
             tenant_deny: None,
@@ -312,6 +318,9 @@ impl Config {
         }
         if let Some(v) = cli.admin_port {
             config.admin_port = Some(v);
+        }
+        if let Some(v) = cli.admin_host {
+            config.admin_host = v;
         }
         if let Some(v) = cli.set_role {
             config.set_role = Some(v);
@@ -462,6 +471,7 @@ fn apply_config_file(config: &mut Config, content: &str) {
                     config.admin_port = Some(v);
                 }
             }
+            "admin_host" => config.admin_host = value,
             "set_role" => config.set_role = Some(value),
             "tenant_allow" => {
                 config.tenant_allow =
@@ -578,6 +588,9 @@ fn apply_env(config: &mut Config) {
         && let Ok(p) = v.parse()
     {
         config.admin_port = Some(p);
+    }
+    if let Ok(v) = std::env::var("PGVPD_ADMIN_HOST") {
+        config.admin_host = v;
     }
     if let Ok(v) = std::env::var("PGVPD_SET_ROLE") {
         config.set_role = Some(v);
@@ -857,73 +870,89 @@ tenant_query_timeout = 30
 
     #[test]
     fn validate_tls_port_without_cert_fails() {
-        let mut config = Config::default();
-        config.tls_port = Some(6433);
+        let config = Config {
+            tls_port: Some(6433),
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
         assert!(config.validate().unwrap_err().contains("tls_cert"));
     }
 
     #[test]
     fn validate_tls_port_with_cert_and_key_passes() {
-        let mut config = Config::default();
-        config.tls_port = Some(6433);
-        config.tls_cert = Some("/tmp/cert.pem".into());
-        config.tls_key = Some("/tmp/key.pem".into());
+        let config = Config {
+            tls_port: Some(6433),
+            tls_cert: Some("/tmp/cert.pem".into()),
+            tls_key: Some("/tmp/key.pem".into()),
+            ..Default::default()
+        };
         assert!(config.validate().is_ok());
     }
 
     #[test]
     fn validate_zero_handshake_timeout_fails() {
-        let mut config = Config::default();
-        config.handshake_timeout_secs = 0;
+        let config = Config {
+            handshake_timeout_secs: 0,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
         assert!(config.validate().unwrap_err().contains("handshake_timeout"));
     }
 
     #[test]
     fn validate_session_pool_without_password_fails() {
-        let mut config = Config::default();
-        config.pool_mode = PoolMode::Session;
-        config.upstream_password = Some("pass".into());
-        // Missing pool_password
+        let config = Config {
+            pool_mode: PoolMode::Session,
+            upstream_password: Some("pass".into()),
+            // Missing pool_password
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
         assert!(config.validate().unwrap_err().contains("pool_password"));
     }
 
     #[test]
     fn validate_session_pool_without_upstream_password_fails() {
-        let mut config = Config::default();
-        config.pool_mode = PoolMode::Session;
-        config.pool_password = Some("pass".into());
-        // Missing upstream_password
+        let config = Config {
+            pool_mode: PoolMode::Session,
+            pool_password: Some("pass".into()),
+            // Missing upstream_password
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
         assert!(config.validate().unwrap_err().contains("upstream_password"));
     }
 
     #[test]
     fn validate_session_pool_with_zero_pool_size_fails() {
-        let mut config = Config::default();
-        config.pool_mode = PoolMode::Session;
-        config.pool_password = Some("pass".into());
-        config.upstream_password = Some("pass".into());
-        config.pool_size = 0;
+        let config = Config {
+            pool_mode: PoolMode::Session,
+            pool_password: Some("pass".into()),
+            upstream_password: Some("pass".into()),
+            pool_size: 0,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
         assert!(config.validate().unwrap_err().contains("pool_size"));
     }
 
     #[test]
     fn validate_session_pool_fully_configured_passes() {
-        let mut config = Config::default();
-        config.pool_mode = PoolMode::Session;
-        config.pool_password = Some("pass".into());
-        config.upstream_password = Some("pass".into());
+        let config = Config {
+            pool_mode: PoolMode::Session,
+            pool_password: Some("pass".into()),
+            upstream_password: Some("pass".into()),
+            ..Default::default()
+        };
         assert!(config.validate().is_ok());
     }
 
     #[test]
     fn validate_resolvers_file_not_found_fails() {
-        let mut config = Config::default();
-        config.resolvers = Some("/nonexistent/path/resolvers.toml".into());
+        let config = Config {
+            resolvers: Some("/nonexistent/path/resolvers.toml".into()),
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
         assert!(
             config
@@ -935,9 +964,11 @@ tenant_query_timeout = 30
 
     #[test]
     fn validate_both_allow_and_deny_fails() {
-        let mut config = Config::default();
-        config.tenant_allow = Some(vec!["a".into()]);
-        config.tenant_deny = Some(vec!["b".into()]);
+        let config = Config {
+            tenant_allow: Some(vec!["a".into()]),
+            tenant_deny: Some(vec!["b".into()]),
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
         assert!(
             config
@@ -954,20 +985,28 @@ tenant_query_timeout = 30
         let config = Config::default();
         assert!(!config.has_tenant_limits());
 
-        let mut config = Config::default();
-        config.tenant_allow = Some(vec!["a".into()]);
+        let config = Config {
+            tenant_allow: Some(vec!["a".into()]),
+            ..Default::default()
+        };
         assert!(config.has_tenant_limits());
 
-        let mut config = Config::default();
-        config.tenant_deny = Some(vec!["b".into()]);
+        let config = Config {
+            tenant_deny: Some(vec!["b".into()]),
+            ..Default::default()
+        };
         assert!(config.has_tenant_limits());
 
-        let mut config = Config::default();
-        config.tenant_max_connections = Some(10);
+        let config = Config {
+            tenant_max_connections: Some(10),
+            ..Default::default()
+        };
         assert!(config.has_tenant_limits());
 
-        let mut config = Config::default();
-        config.tenant_rate_limit = Some(5);
+        let config = Config {
+            tenant_rate_limit: Some(5),
+            ..Default::default()
+        };
         assert!(config.has_tenant_limits());
     }
 

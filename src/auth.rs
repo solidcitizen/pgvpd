@@ -17,7 +17,7 @@ use crate::protocol::{
     build_sasl_initial_response, build_sasl_response, try_read_backend_message,
     try_read_password_message,
 };
-use crate::stream::{ClientStream, UpstreamStream};
+use crate::stream::{ClientStream, UpstreamStream, read_or_eof};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -80,7 +80,7 @@ pub async fn authenticate_upstream(
     loop {
         // Read more data if buffer has no complete message
         if server_buf.is_empty() {
-            server.read_buf(server_buf).await?;
+            read_or_eof(server, server_buf).await?;
         }
 
         while let Some(msg) = try_read_backend_message(server_buf) {
@@ -183,7 +183,7 @@ async fn scram_authenticate(
     // Read server-first-message (AuthenticationSASLContinue)
     let server_first = loop {
         if server_buf.is_empty() {
-            server.read_buf(server_buf).await?;
+            read_or_eof(server, server_buf).await?;
         }
         if let Some(msg) = try_read_backend_message(server_buf) {
             if msg.is_error_response() {
@@ -237,7 +237,7 @@ async fn scram_authenticate(
     // Read server-final-message (AuthenticationSASLFinal)
     let server_final = loop {
         if server_buf.is_empty() {
-            server.read_buf(server_buf).await?;
+            read_or_eof(server, server_buf).await?;
         }
         if let Some(msg) = try_read_backend_message(server_buf) {
             if msg.is_error_response() {

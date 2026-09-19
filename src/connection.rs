@@ -17,16 +17,17 @@ use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
 
 use crate::auth;
+use crate::cancel::{CancelRegistry, CancelTarget};
 use crate::config::{Config, PoolMode};
 use crate::metrics::Metrics;
 use crate::pool::{Pool, PoolKey, PoolLease};
 use crate::protocol::{
-    BackendFrameTracker, SSL_DENY, StartupType, build_error_response, build_query_message,
-    build_startup_message, escape_set_value, quote_ident, try_read_backend_message,
-    try_read_startup,
+    BackendFrameTracker, SSL_DENY, StartupType, build_backend_key_data, build_error_response,
+    build_query_message, build_startup_message, escape_set_value, quote_ident,
+    try_read_backend_message, try_read_startup,
 };
 use crate::resolver::ResolverEngine;
-use crate::stream::{ClientStream, UpstreamStream};
+use crate::stream::{ClientStream, UpstreamStream, read_or_eof};
 use crate::tenant::{TenantGuard, TenantRegistry};
 use crate::tls::parse_server_name;
 
@@ -42,6 +43,11 @@ pub enum HandshakeResult {
         /// Bytes upstream sent after the injection's ReadyForQuery (async
         /// messages such as notices). They belong to the client.
         leftover: BytesMut,
+        /// This upstream connection's real backend key, for routing cancels.
+        real_key: Option<(u32, u32)>,
+        /// The (pid, secret) pgvpd minted and handed this client, registered in
+        /// the cancel registry for the life of the pipe.
+        client_cancel_key: (u32, u32),
     },
     /// Fully handled (cancel request, error, etc.) — nothing more to do.
     Done,
@@ -56,6 +62,7 @@ pub async fn handle_connection(
     pool: Option<Arc<Pool>>,
     resolver_engine: Option<Arc<ResolverEngine>>,
     tenant_registry: Option<Arc<TenantRegistry>>,
+    cancel: Arc<CancelRegistry>,
     config_metrics: Arc<Metrics>,
     conn_id: u64,
 ) {
@@ -76,6 +83,7 @@ pub async fn handle_connection(
             &pool,
             &resolver_engine,
             &tenant_registry,
+            &cancel,
             conn_id,
         ),
     )
@@ -135,8 +143,17 @@ pub async fn handle_connection(
             mut stream,
             lease,
             leftover,
+            real_key,
+            client_cancel_key,
         } => {
             debug!(conn_id, "transparent pipe (pooled)");
+            // Register this client's cancel key → its upstream connection for the
+            // life of the pipe. The guard removes it when the pipe ends (or is
+            // cancelled), so a cancel never routes to a connection this client no
+            // longer holds. Only register when we know the real upstream key.
+            let _cancel_guard = real_key.map(|(pid, secret)| {
+                cancel.register(client_cancel_key, CancelTarget { pid, secret })
+            });
             let outcome = pipe_pooled(
                 &mut client,
                 &mut stream,
@@ -149,7 +166,7 @@ pub async fn handle_connection(
             if let Some(e) = outcome.end.error() {
                 debug!(conn_id, error = %e, "connection ended");
             }
-            lease.checkin(stream, conn_id, outcome).await;
+            lease.checkin(stream, real_key, conn_id, outcome).await;
         }
     }
 }
@@ -345,6 +362,7 @@ async fn forward_client_messages(
 }
 
 /// Run the handshake phases: startup parsing, auth relay, context injection.
+#[allow(clippy::too_many_arguments)]
 async fn handshake(
     client: &mut ClientStream,
     config: &Config,
@@ -352,6 +370,7 @@ async fn handshake(
     pool: &Option<Arc<Pool>>,
     resolver_engine: &Option<Arc<ResolverEngine>>,
     tenant_registry: &Option<Arc<TenantRegistry>>,
+    cancel: &Arc<CancelRegistry>,
     conn_id: u64,
 ) -> Result<(HandshakeResult, Option<TenantGuard>), Box<dyn std::error::Error + Send + Sync>> {
     // ─── Phase 1: Read StartupMessage ───────────────────────────────────
@@ -359,7 +378,7 @@ async fn handshake(
     let mut buf = BytesMut::with_capacity(1024);
 
     let startup = loop {
-        client.read_buf(&mut buf).await?;
+        read_or_eof(client, &mut buf).await?;
 
         match try_read_startup(&mut buf) {
             Some(StartupType::SslRequest) => {
@@ -367,8 +386,17 @@ async fn handshake(
                 client.write_all(SSL_DENY).await?;
                 continue;
             }
-            Some(StartupType::CancelRequest) => {
-                debug!(conn_id, "cancel request — closing");
+            Some(StartupType::CancelRequest { pid, secret }) => {
+                // Route the cancel to the upstream connection this client's
+                // minted key maps to — and only that one. An unknown or stale
+                // key resolves to nothing and is a safe no-op.
+                match cancel.lookup((pid, secret)) {
+                    Some(target) => {
+                        debug!(conn_id, "cancel request — forwarding to upstream");
+                        forward_cancel(config, upstream_tls, target, conn_id).await;
+                    }
+                    None => debug!(conn_id, "cancel request — no matching session, ignoring"),
+                }
                 return Ok((HandshakeResult::Done, None));
             }
             Some(StartupType::Startup(s)) => break s,
@@ -554,7 +582,7 @@ async fn handle_passthrough(
     let mut auth_done = false;
 
     while !auth_done {
-        server.read_buf(&mut server_buf).await?;
+        read_or_eof(&mut server, &mut server_buf).await?;
 
         while let Some(msg) = try_read_backend_message(&mut server_buf) {
             if msg.is_auth_ok() {
@@ -572,7 +600,7 @@ async fn handle_passthrough(
 
             if msg.is_auth_challenge() {
                 let mut client_buf = BytesMut::with_capacity(1024);
-                client.read_buf(&mut client_buf).await?;
+                read_or_eof(client, &mut client_buf).await?;
                 server.write_all(&client_buf).await?;
             }
         }
@@ -582,7 +610,7 @@ async fn handle_passthrough(
 
     let buffered_ready: BytesMut = loop {
         if server_buf.is_empty() {
-            server.read_buf(&mut server_buf).await?;
+            read_or_eof(&mut server, &mut server_buf).await?;
         }
 
         let mut ready_msg = None;
@@ -644,6 +672,34 @@ async fn handle_passthrough(
     Ok((HandshakeResult::Passthrough(server), None))
 }
 
+/// Reset a checked-out pooled connection with `DISCARD ALL`, reading to
+/// ReadyForQuery. Returns `Err(reason)` if the reset fails for any reason — a
+/// dead socket, EOF, or an ErrorResponse (a terminated/restarted backend emits
+/// a FATAL before closing). A reset never legitimately fails on a reusable
+/// connection, so the caller discards it and retries with a fresh one.
+async fn reset_pooled(
+    server: &mut UpstreamStream,
+    server_buf: &mut BytesMut,
+) -> Result<(), String> {
+    let reset_msg = build_query_message("DISCARD ALL;");
+    if server.write_all(&reset_msg).await.is_err() {
+        return Err("write to upstream failed".into());
+    }
+    loop {
+        if read_or_eof(server, server_buf).await.is_err() {
+            return Err("upstream closed connection".into());
+        }
+        while let Some(msg) = try_read_backend_message(server_buf) {
+            if msg.is_error_response() {
+                return Err(msg.error_message());
+            }
+            if msg.is_ready_for_query() {
+                return Ok(());
+            }
+        }
+    }
+}
+
 /// Pool mode — pgvpd authenticates client, checks out pooled connection,
 /// resets, resolves context, injects, then enters transparent pipe.
 #[allow(clippy::too_many_arguments)]
@@ -672,54 +728,73 @@ async fn handle_pooled(
         role: actual_user.to_string(),
     };
 
-    let pooled = match pool.checkout(&key, conn_id).await {
-        Ok(c) => c,
-        Err(e) => {
-            send_error(
-                client,
-                "FATAL",
-                "53300",
-                &format!("pool checkout failed: {e}"),
-            )
-            .await;
-            return Ok((HandshakeResult::Done, None));
+    // Check out a live, reset connection. A pooled connection whose upstream
+    // went away (restart/failover) fails its reset; discard it and retry with a
+    // fresh one so the client connects transparently instead of one client
+    // failing per stale connection (issue #15). If the upstream is genuinely
+    // down, `checkout` (create_connection) fails and we surface that error
+    // rather than looping.
+    const MAX_CHECKOUT_ATTEMPTS: u32 = 3;
+    let (mut server, lease, mut server_buf, param_statuses, real_key) = {
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let pooled = match pool.checkout(&key, conn_id).await {
+                Ok(c) => c,
+                Err(e) => {
+                    send_error(
+                        client,
+                        "FATAL",
+                        "53300",
+                        &format!("pool checkout failed: {e}"),
+                    )
+                    .await;
+                    return Ok((HandshakeResult::Done, None));
+                }
+            };
+
+            // The slot is leased: any early return, or a drop on retry, releases it.
+            let lease = PoolLease::new(Arc::clone(pool), key.clone());
+            let mut server = pooled.stream;
+            let mut server_buf = BytesMut::with_capacity(4096);
+
+            match reset_pooled(&mut server, &mut server_buf).await {
+                Ok(()) => {
+                    break (
+                        server,
+                        lease,
+                        server_buf,
+                        pooled.param_statuses,
+                        pooled.real_key,
+                    );
+                }
+                Err(reason) => {
+                    // The pooled connection could not be reset — its upstream is
+                    // gone (restart/failover) or otherwise unusable. Dropping the
+                    // lease at the end of this iteration discards it and releases
+                    // the slot before the next checkout; retry with a fresh
+                    // upstream so the client connects transparently.
+                    if attempt >= MAX_CHECKOUT_ATTEMPTS {
+                        warn!(
+                            conn_id,
+                            attempts = attempt,
+                            reason = %reason,
+                            "pool: upstream unavailable after retries"
+                        );
+                        send_error(client, "FATAL", "57P01", "upstream unavailable").await;
+                        return Ok((HandshakeResult::Done, None));
+                    }
+                    info!(
+                        conn_id,
+                        attempt,
+                        reason = %reason,
+                        "pool: reset failed — discarding and retrying with a fresh upstream"
+                    );
+                    continue;
+                }
+            }
         }
     };
-
-    // From here on the slot is leased: any early return releases it.
-    let lease = PoolLease::new(Arc::clone(pool), key);
-    let mut server = pooled.stream;
-    let mut server_buf = BytesMut::with_capacity(4096);
-
-    // ─── Reset connection ───────────────────────────────────────────────
-
-    let reset_msg = build_query_message("DISCARD ALL;");
-    server.write_all(&reset_msg).await?;
-
-    loop {
-        server.read_buf(&mut server_buf).await?;
-        let mut done = false;
-        while let Some(msg) = try_read_backend_message(&mut server_buf) {
-            if msg.is_error_response() {
-                error!(conn_id, error = %msg.error_message(), "pool: DISCARD ALL failed");
-                send_error(
-                    client,
-                    "FATAL",
-                    "XX000",
-                    &format!("DISCARD ALL failed: {}", msg.error_message()),
-                )
-                .await;
-                return Ok((HandshakeResult::Done, None));
-            }
-            if msg.is_ready_for_query() {
-                done = true;
-                break;
-            }
-        }
-        if done {
-            break;
-        }
-    }
 
     // ─── Resolve context ────────────────────────────────────────────────
 
@@ -758,7 +833,7 @@ async fn handle_pooled(
     server.write_all(&query_msg).await?;
 
     loop {
-        server.read_buf(&mut server_buf).await?;
+        read_or_eof(&mut server, &mut server_buf).await?;
         let mut done = false;
         while let Some(msg) = try_read_backend_message(&mut server_buf) {
             if msg.is_error_response() {
@@ -784,10 +859,22 @@ async fn handle_pooled(
 
     // ─── Synthesize handshake to client ─────────────────────────────────
 
-    for ps in &pooled.param_statuses {
+    for ps in &param_statuses {
         client.write_all(ps).await?;
     }
-    client.write_all(&pooled.backend_key_data).await?;
+    // Hand the client pgvpd's OWN minted BackendKeyData, never the real (bucket-
+    // shared) upstream key. The cancel registry maps this minted key back to this
+    // client's upstream connection so a CancelRequest reaches only its own query.
+    let client_cancel_key = (
+        rand::random::<u32>() & 0x7fff_ffff,
+        rand::random::<u32>() & 0x7fff_ffff,
+    );
+    client
+        .write_all(&build_backend_key_data(
+            client_cancel_key.0,
+            client_cancel_key.1,
+        ))
+        .await?;
     let ready = build_ready_for_query();
     client.write_all(&ready).await?;
 
@@ -809,6 +896,8 @@ async fn handle_pooled(
             stream: server,
             lease,
             leftover: server_buf,
+            real_key,
+            client_cancel_key,
         },
         None,
     ))
@@ -866,7 +955,7 @@ async fn inject_context_from_map(
     server.write_all(&query_msg).await?;
 
     loop {
-        server.read_buf(server_buf).await?;
+        read_or_eof(server, server_buf).await?;
 
         let mut injection_done = false;
         while let Some(msg) = try_read_backend_message(server_buf) {
@@ -925,6 +1014,26 @@ pub async fn connect_upstream(
         Ok(UpstreamStream::Tls(tls_stream))
     } else {
         Ok(UpstreamStream::Plain(tcp))
+    }
+}
+
+/// Forward a client's CancelRequest to the upstream connection it maps to.
+/// PostgreSQL requires a cancel on a fresh connection and returns no reply, so
+/// this connects, writes the CancelRequest for the real upstream key, and closes.
+async fn forward_cancel(
+    config: &Config,
+    upstream_tls: &Option<Arc<ClientConfig>>,
+    target: CancelTarget,
+    conn_id: u64,
+) {
+    match connect_upstream(config, upstream_tls).await {
+        Ok(mut server) => {
+            let msg = crate::protocol::build_cancel_request(target.pid, target.secret);
+            let _ = server.write_all(&msg).await;
+            let _ = server.shutdown().await;
+            debug!(conn_id, "cancel: forwarded to upstream");
+        }
+        Err(e) => debug!(conn_id, error = %e, "cancel: upstream connect failed"),
     }
 }
 

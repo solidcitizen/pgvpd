@@ -53,8 +53,9 @@ pub mod auth {
 pub enum StartupType {
     /// SSLRequest — client wants to negotiate TLS.
     SslRequest,
-    /// CancelRequest — client wants to cancel a query.
-    CancelRequest,
+    /// CancelRequest — client wants to cancel a query. Carries the (pid,
+    /// secret) key the client was handed at connect time.
+    CancelRequest { pid: u32, secret: u32 },
     /// Normal StartupMessage with parameters.
     Startup(StartupMessage),
 }
@@ -210,7 +211,15 @@ pub fn try_read_startup(buf: &mut BytesMut) -> Option<StartupType> {
 
     match version {
         v if v == SSL_REQUEST_CODE => Some(StartupType::SslRequest),
-        v if v == CANCEL_REQUEST_CODE => Some(StartupType::CancelRequest),
+        v if v == CANCEL_REQUEST_CODE => {
+            // CancelRequest is length(16) + code + pid + secret.
+            if length < 16 {
+                return Some(StartupType::CancelRequest { pid: 0, secret: 0 });
+            }
+            let pid = u32::from_be_bytes([msg_buf[8], msg_buf[9], msg_buf[10], msg_buf[11]]);
+            let secret = u32::from_be_bytes([msg_buf[12], msg_buf[13], msg_buf[14], msg_buf[15]]);
+            Some(StartupType::CancelRequest { pid, secret })
+        }
         _ => {
             // Parse key-value pairs
             let mut params = HashMap::new();
@@ -359,6 +368,40 @@ pub fn build_startup_message(params: &HashMap<String, String>) -> BytesMut {
     }
     buf.put_u8(0); // terminal null
 
+    buf
+}
+
+/// Build a CancelRequest message: length(16) + code + pid + secret. Sent on a
+/// fresh connection to the server whose query should be cancelled.
+pub fn build_cancel_request(pid: u32, secret: u32) -> BytesMut {
+    let mut buf = BytesMut::with_capacity(16);
+    buf.put_i32(16);
+    buf.put_i32(CANCEL_REQUEST_CODE);
+    buf.put_u32(pid);
+    buf.put_u32(secret);
+    buf
+}
+
+/// Parse (pid, secret) from a BackendKeyData ('K') message's raw bytes.
+/// Layout: 'K' + int32 length(12) + int32 pid + int32 secret.
+pub fn parse_backend_key_data(raw: &[u8]) -> Option<(u32, u32)> {
+    if raw.len() < 13 || raw[0] != b'K' {
+        return None;
+    }
+    let pid = u32::from_be_bytes([raw[5], raw[6], raw[7], raw[8]]);
+    let secret = u32::from_be_bytes([raw[9], raw[10], raw[11], raw[12]]);
+    Some((pid, secret))
+}
+
+/// Build a BackendKeyData ('K') message from a (pid, secret) pair — pgvpd mints
+/// its own per-client key so a client's CancelRequest can be routed to the right
+/// upstream connection without exposing the real upstream key.
+pub fn build_backend_key_data(pid: u32, secret: u32) -> BytesMut {
+    let mut buf = BytesMut::with_capacity(13);
+    buf.put_u8(b'K');
+    buf.put_i32(12);
+    buf.put_u32(pid);
+    buf.put_u32(secret);
     buf
 }
 
@@ -578,8 +621,35 @@ mod tests {
         buf.put_i32(5678); // secret key
         assert!(matches!(
             try_read_startup(&mut buf),
-            Some(StartupType::CancelRequest)
+            Some(StartupType::CancelRequest {
+                pid: 1234,
+                secret: 5678
+            })
         ));
+    }
+
+    #[test]
+    fn cancel_request_round_trip() {
+        let mut buf = build_cancel_request(4242, 99999);
+        assert!(matches!(
+            try_read_startup(&mut buf),
+            Some(StartupType::CancelRequest {
+                pid: 4242,
+                secret: 99999
+            })
+        ));
+    }
+
+    #[test]
+    fn backend_key_data_round_trip() {
+        let raw = build_backend_key_data(31415, 271828);
+        assert_eq!(parse_backend_key_data(&raw), Some((31415, 271828)));
+    }
+
+    #[test]
+    fn parse_backend_key_data_rejects_wrong_type() {
+        assert_eq!(parse_backend_key_data(b"Z\x00\x00\x00\x05I"), None);
+        assert_eq!(parse_backend_key_data(b"K\x00\x00"), None);
     }
 
     #[test]
@@ -634,7 +704,7 @@ mod tests {
 
     #[test]
     fn parse_backend_message_ready_for_query() {
-        let mut buf = build_raw_backend_message(backend::READY_FOR_QUERY, &[b'I']);
+        let mut buf = build_raw_backend_message(backend::READY_FOR_QUERY, b"I");
         let msg = try_read_backend_message(&mut buf).unwrap();
         assert!(msg.is_ready_for_query());
         assert_eq!(msg.payload.len(), 1);
@@ -703,7 +773,7 @@ mod tests {
     #[test]
     fn auth_subtype_extraction() {
         // Non-auth message returns None
-        let mut buf = build_raw_backend_message(backend::READY_FOR_QUERY, &[b'I']);
+        let mut buf = build_raw_backend_message(backend::READY_FOR_QUERY, b"I");
         let msg = try_read_backend_message(&mut buf).unwrap();
         assert_eq!(msg.auth_subtype(), None);
 
@@ -744,7 +814,7 @@ mod tests {
 
     #[test]
     fn non_error_message_returns_not_an_error() {
-        let mut buf = build_raw_backend_message(backend::READY_FOR_QUERY, &[b'I']);
+        let mut buf = build_raw_backend_message(backend::READY_FOR_QUERY, b"I");
         let msg = try_read_backend_message(&mut buf).unwrap();
         assert_eq!(msg.error_message(), "not an error");
     }
@@ -849,7 +919,7 @@ mod tests {
     fn parse_multiple_backend_messages_from_single_buffer() {
         let mut buf = BytesMut::new();
         // Message 1: ReadyForQuery
-        let msg1 = build_raw_backend_message(backend::READY_FOR_QUERY, &[b'I']);
+        let msg1 = build_raw_backend_message(backend::READY_FOR_QUERY, b"I");
         buf.extend_from_slice(&msg1);
         // Message 2: AuthOk
         let mut auth_payload = BytesMut::new();

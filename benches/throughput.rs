@@ -78,8 +78,8 @@ fn read_until_ready(stream: &mut TcpStream) -> std::io::Result<()> {
         // Scan for ReadyForQuery ('Z')
         // In the backend message format: type(1) + length(4) + payload
         // ReadyForQuery is: 'Z' + int32(5) + byte(status)
-        for i in 0..n {
-            if buf[i] == b'Z' && i + 5 < n {
+        for (i, &b) in buf.iter().enumerate().take(n) {
+            if b == b'Z' && i + 5 < n {
                 // This is a rough scan — sufficient for benchmarking
                 return Ok(());
             }
@@ -129,12 +129,9 @@ fn connect_and_auth(
             }
             3 => {
                 // Cleartext password
-                if let Some(pw) = password {
-                    let pw_msg = build_password_msg(pw);
-                    stream.write_all(&pw_msg).ok()?;
-                } else {
-                    return None;
-                }
+                let pw = password?;
+                let pw_msg = build_password_msg(pw);
+                stream.write_all(&pw_msg).ok()?;
             }
             _ => return None, // Unsupported auth for benchmark
         }
