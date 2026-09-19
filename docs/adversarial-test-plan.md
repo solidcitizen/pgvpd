@@ -114,7 +114,7 @@ exhaustion returns a clean error within bounded time; no busy loops.
 | Scenario | Coverage | Tests | Mutant |
 |---|---|---|---|
 | leak after checkout on error (fixed 1.0.3 via `PoolLease`) | gap (test) | add 2.8: `set_role = does_not_exist` conf → every connection fails after checkout; assert gauge returns to 0 and a later good checkout succeeds | disarm the lease early |
-| upstream restart | gap | add chaos: `docker compose restart postgres` mid-run; assert checkouts recover and gauge equals live connections | skip `decrement_total` on upstream EOF |
+| upstream restart | **fixed 1.0.6** (#15) — Suite 13 (`tests/drizzle/upstream-restart.mjs`) warms the pool, kills pgvpd's upstream backends via `pg_terminate_backend`, and asserts reused checkouts recover on a fresh connection. Checkout discards a connection that fails its reset and retries (bounded). | remove the discard-and-retry loop |
 | exhaustion | partial (5.3 is per-tenant, not pool) | add 2.9: `pool_size = 1`, hold one, second client gets `53300` within `pool_checkout_timeout` + 1 s | remove the deadline |
 | busy loop — full pool | known: checkout polls every 50 ms while full | improvement: `tokio::sync::Notify` on checkin (issue to open) | — |
 | busy loop — EOF spin (issue #24) | **finding** — see 5a | new suite (5a) | — |

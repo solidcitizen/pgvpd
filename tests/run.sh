@@ -853,6 +853,34 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Suite 13: Dead upstream is discarded and retried, not surfaced (issue #15)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# A pooled connection whose upstream went away (restart/failover/terminated
+# backend) must not fail the next client. The harness warms the pool, kills
+# pgvpd's upstream backends directly in Postgres, then reconnects through the
+# proxy: checkouts that reuse the dead connections must recover on a fresh one.
+
+if ! command -v node &>/dev/null; then
+  echo ""
+  echo "═══ Suite 13: Upstream restart recovery (SKIPPED — node not found) ═══"
+else
+  echo ""
+  echo "═══ Suite 13: Dead upstream discard-and-retry ═══"
+  case "$PGVPD_BIN" in
+    /*) RESTART_BIN="$PGVPD_BIN" ;;
+    *)  RESTART_BIN="$(pwd)/$PGVPD_BIN" ;;
+  esac
+  restart_result=0
+  (cd tests/drizzle && PGVPD_BIN="$RESTART_BIN" UP_HOST=$PG_HOST UP_PORT=$PG_PORT PG_DB=$PG_DB PG_PASS=$PG_PASS node upstream-restart.mjs) || restart_result=$?
+  if [ $restart_result -eq 0 ]; then
+    pass "13.1 Upstream restart — dead pooled connection discarded and retried (issue #15)"
+  else
+    fail "13.1 Upstream restart — client victimized by dead pooled connection (exit $restart_result)"
+  fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Summary
 # ═══════════════════════════════════════════════════════════════════════════
 

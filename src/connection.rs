@@ -644,6 +644,34 @@ async fn handle_passthrough(
     Ok((HandshakeResult::Passthrough(server), None))
 }
 
+/// Reset a checked-out pooled connection with `DISCARD ALL`, reading to
+/// ReadyForQuery. Returns `Err(reason)` if the reset fails for any reason — a
+/// dead socket, EOF, or an ErrorResponse (a terminated/restarted backend emits
+/// a FATAL before closing). A reset never legitimately fails on a reusable
+/// connection, so the caller discards it and retries with a fresh one.
+async fn reset_pooled(
+    server: &mut UpstreamStream,
+    server_buf: &mut BytesMut,
+) -> Result<(), String> {
+    let reset_msg = build_query_message("DISCARD ALL;");
+    if server.write_all(&reset_msg).await.is_err() {
+        return Err("write to upstream failed".into());
+    }
+    loop {
+        if read_or_eof(server, server_buf).await.is_err() {
+            return Err("upstream closed connection".into());
+        }
+        while let Some(msg) = try_read_backend_message(server_buf) {
+            if msg.is_error_response() {
+                return Err(msg.error_message());
+            }
+            if msg.is_ready_for_query() {
+                return Ok(());
+            }
+        }
+    }
+}
+
 /// Pool mode — pgvpd authenticates client, checks out pooled connection,
 /// resets, resolves context, injects, then enters transparent pipe.
 #[allow(clippy::too_many_arguments)]
@@ -672,54 +700,73 @@ async fn handle_pooled(
         role: actual_user.to_string(),
     };
 
-    let pooled = match pool.checkout(&key, conn_id).await {
-        Ok(c) => c,
-        Err(e) => {
-            send_error(
-                client,
-                "FATAL",
-                "53300",
-                &format!("pool checkout failed: {e}"),
-            )
-            .await;
-            return Ok((HandshakeResult::Done, None));
+    // Check out a live, reset connection. A pooled connection whose upstream
+    // went away (restart/failover) fails its reset; discard it and retry with a
+    // fresh one so the client connects transparently instead of one client
+    // failing per stale connection (issue #15). If the upstream is genuinely
+    // down, `checkout` (create_connection) fails and we surface that error
+    // rather than looping.
+    const MAX_CHECKOUT_ATTEMPTS: u32 = 3;
+    let (mut server, lease, mut server_buf, param_statuses, backend_key_data) = {
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let pooled = match pool.checkout(&key, conn_id).await {
+                Ok(c) => c,
+                Err(e) => {
+                    send_error(
+                        client,
+                        "FATAL",
+                        "53300",
+                        &format!("pool checkout failed: {e}"),
+                    )
+                    .await;
+                    return Ok((HandshakeResult::Done, None));
+                }
+            };
+
+            // The slot is leased: any early return, or a drop on retry, releases it.
+            let lease = PoolLease::new(Arc::clone(pool), key.clone());
+            let mut server = pooled.stream;
+            let mut server_buf = BytesMut::with_capacity(4096);
+
+            match reset_pooled(&mut server, &mut server_buf).await {
+                Ok(()) => {
+                    break (
+                        server,
+                        lease,
+                        server_buf,
+                        pooled.param_statuses,
+                        pooled.backend_key_data,
+                    );
+                }
+                Err(reason) => {
+                    // The pooled connection could not be reset — its upstream is
+                    // gone (restart/failover) or otherwise unusable. Dropping the
+                    // lease at the end of this iteration discards it and releases
+                    // the slot before the next checkout; retry with a fresh
+                    // upstream so the client connects transparently.
+                    if attempt >= MAX_CHECKOUT_ATTEMPTS {
+                        warn!(
+                            conn_id,
+                            attempts = attempt,
+                            reason = %reason,
+                            "pool: upstream unavailable after retries"
+                        );
+                        send_error(client, "FATAL", "57P01", "upstream unavailable").await;
+                        return Ok((HandshakeResult::Done, None));
+                    }
+                    info!(
+                        conn_id,
+                        attempt,
+                        reason = %reason,
+                        "pool: reset failed — discarding and retrying with a fresh upstream"
+                    );
+                    continue;
+                }
+            }
         }
     };
-
-    // From here on the slot is leased: any early return releases it.
-    let lease = PoolLease::new(Arc::clone(pool), key);
-    let mut server = pooled.stream;
-    let mut server_buf = BytesMut::with_capacity(4096);
-
-    // ─── Reset connection ───────────────────────────────────────────────
-
-    let reset_msg = build_query_message("DISCARD ALL;");
-    server.write_all(&reset_msg).await?;
-
-    loop {
-        read_or_eof(&mut server, &mut server_buf).await?;
-        let mut done = false;
-        while let Some(msg) = try_read_backend_message(&mut server_buf) {
-            if msg.is_error_response() {
-                error!(conn_id, error = %msg.error_message(), "pool: DISCARD ALL failed");
-                send_error(
-                    client,
-                    "FATAL",
-                    "XX000",
-                    &format!("DISCARD ALL failed: {}", msg.error_message()),
-                )
-                .await;
-                return Ok((HandshakeResult::Done, None));
-            }
-            if msg.is_ready_for_query() {
-                done = true;
-                break;
-            }
-        }
-        if done {
-            break;
-        }
-    }
 
     // ─── Resolve context ────────────────────────────────────────────────
 
@@ -784,10 +831,10 @@ async fn handle_pooled(
 
     // ─── Synthesize handshake to client ─────────────────────────────────
 
-    for ps in &pooled.param_statuses {
+    for ps in &param_statuses {
         client.write_all(ps).await?;
     }
-    client.write_all(&pooled.backend_key_data).await?;
+    client.write_all(&backend_key_data).await?;
     let ready = build_ready_for_query();
     client.write_all(&ready).await?;
 

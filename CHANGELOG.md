@@ -5,6 +5,15 @@ All notable changes to pgvpd are documented here.
 ## [Unreleased]
 
 ### Fixed
+- Pool mode: a pooled connection whose upstream had gone away (Postgres
+  restart, failover, or an administrator terminating the backend) failed the
+  next client that checked it out — the `DISCARD ALL` reset hit a dead socket or
+  a FATAL from the terminating backend and surfaced as a connection error. After
+  an upstream bounce, one client was victimized per stale pooled connection until
+  the bucket cleared. Checkout now discards a connection that fails its reset and
+  retries with a fresh one (bounded), so the client connects transparently; if
+  the upstream is genuinely down, `create_connection` fails and that error is
+  surfaced instead of looping. Pre-existing since pooling (0.3). (#15)
 - Admin API bound `0.0.0.0` unconditionally, exposing the unauthenticated
   `/status` and `/metrics` endpoints — which reveal pool topology (every
   `database`, `role`, and bucket count) — on every interface. On a multi-homed
