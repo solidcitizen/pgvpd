@@ -150,12 +150,13 @@ mod tests {
         max_conn: Option<u32>,
         rate: Option<u32>,
     ) -> Config {
-        let mut config = Config::default();
-        config.tenant_allow = allow.map(|v| v.into_iter().map(String::from).collect());
-        config.tenant_deny = deny.map(|v| v.into_iter().map(String::from).collect());
-        config.tenant_max_connections = max_conn;
-        config.tenant_rate_limit = rate;
-        config
+        Config {
+            tenant_allow: allow.map(|v| v.into_iter().map(String::from).collect()),
+            tenant_deny: deny.map(|v| v.into_iter().map(String::from).collect()),
+            tenant_max_connections: max_conn,
+            tenant_rate_limit: rate,
+            ..Default::default()
+        }
     }
 
     fn make_metrics() -> Arc<Metrics> {

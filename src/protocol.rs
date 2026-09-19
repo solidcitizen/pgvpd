@@ -704,7 +704,7 @@ mod tests {
 
     #[test]
     fn parse_backend_message_ready_for_query() {
-        let mut buf = build_raw_backend_message(backend::READY_FOR_QUERY, &[b'I']);
+        let mut buf = build_raw_backend_message(backend::READY_FOR_QUERY, b"I");
         let msg = try_read_backend_message(&mut buf).unwrap();
         assert!(msg.is_ready_for_query());
         assert_eq!(msg.payload.len(), 1);
@@ -773,7 +773,7 @@ mod tests {
     #[test]
     fn auth_subtype_extraction() {
         // Non-auth message returns None
-        let mut buf = build_raw_backend_message(backend::READY_FOR_QUERY, &[b'I']);
+        let mut buf = build_raw_backend_message(backend::READY_FOR_QUERY, b"I");
         let msg = try_read_backend_message(&mut buf).unwrap();
         assert_eq!(msg.auth_subtype(), None);
 
@@ -814,7 +814,7 @@ mod tests {
 
     #[test]
     fn non_error_message_returns_not_an_error() {
-        let mut buf = build_raw_backend_message(backend::READY_FOR_QUERY, &[b'I']);
+        let mut buf = build_raw_backend_message(backend::READY_FOR_QUERY, b"I");
         let msg = try_read_backend_message(&mut buf).unwrap();
         assert_eq!(msg.error_message(), "not an error");
     }
@@ -919,7 +919,7 @@ mod tests {
     fn parse_multiple_backend_messages_from_single_buffer() {
         let mut buf = BytesMut::new();
         // Message 1: ReadyForQuery
-        let msg1 = build_raw_backend_message(backend::READY_FOR_QUERY, &[b'I']);
+        let msg1 = build_raw_backend_message(backend::READY_FOR_QUERY, b"I");
         buf.extend_from_slice(&msg1);
         // Message 2: AuthOk
         let mut auth_payload = BytesMut::new();

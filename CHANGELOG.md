@@ -13,6 +13,15 @@ All notable changes to pgvpd are documented here.
   hit another tenant's query. A regression suite proves a cancel aborts only the
   issuing client's query (57014) and leaves a concurrent tenant untouched.
 
+### Changed
+- Cleanup from NexusPlus's hostile round (#16): `pgvpd_pool_creates_total` now
+  counts successful connection creates only (it previously incremented before
+  `create_connection`, so a failed connect inflated it); a pooled-connection
+  reset that exceeds the timeout is now logged distinctly ("reset timed out")
+  from one that fails ("reset failed"); and the CI lint gate runs
+  `cargo clippy --all-targets -- -D warnings`, covering tests and benches, with
+  the pre-existing lint backlog cleared.
+
 ### Fixed
 - Pool mode: a client that dropped an in-flight query left it running upstream
   until the checkin drain timed out (up to 5s), pinning the pooled slot. pgvpd

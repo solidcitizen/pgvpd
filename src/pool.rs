@@ -183,11 +183,13 @@ impl Pool {
                     key,
                     armed: true,
                 };
-                Metrics::inc(&self.metrics.pool_creates);
                 debug!(conn_id, database = %key.database, role = %key.role, "pool: creating new connection");
                 match self.create_connection(key, conn_id).await {
                     Ok(conn) => {
                         reservation.disarm();
+                        // Count creates on success only — a failed connect must
+                        // not inflate pool_creates_total (issue #16).
+                        Metrics::inc(&self.metrics.pool_creates);
                         // Cache handshake data on first connection for this bucket
                         let mut buckets = self.lock_buckets();
                         if let Some(bucket) = buckets.get_mut(key)
@@ -325,9 +327,14 @@ impl Pool {
                     debug!(conn_id, "pool: bucket gone, discarding connection");
                 }
             }
-            _ => {
+            other => {
+                // Distinguish a reset that failed from one that exceeded the
+                // timeout, so a drain/reset timeout is clearly logged (issue #16).
                 Metrics::inc(&self.metrics.pool_discards);
-                warn!(conn_id, "pool: reset failed or timed out, discarding");
+                match other {
+                    Err(_) => warn!(conn_id, "pool: reset timed out, discarding"),
+                    _ => warn!(conn_id, "pool: reset failed, discarding"),
+                }
                 self.decrement_total(&key);
             }
         }
