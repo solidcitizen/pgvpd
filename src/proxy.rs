@@ -178,7 +178,11 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             pool: pool.clone(),
             resolver: resolver_engine.clone(),
         };
-        tokio::spawn(admin::serve(admin_state, admin_port));
+        tokio::spawn(admin::serve(
+            admin_state,
+            config.admin_host.clone(),
+            admin_port,
+        ));
     }
 
     // ─── TLS listener (if configured) ───────────────────────────────────

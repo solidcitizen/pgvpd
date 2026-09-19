@@ -173,7 +173,7 @@ trusted party. The boundary must therefore be the network.
 | Item | Status |
 |---|---|
 | proxy listener defaults to `127.0.0.1` (`listen_host`) | have |
-| admin API binds `0.0.0.0:<admin_port>`, unauthenticated | **finding** — issue #13; fix: bind to `listen_host` by default, add `admin_host` for deliberate exposure; consider a bearer token |
+| admin API binds `0.0.0.0:<admin_port>`, unauthenticated | **fixed 1.0.6** (#13) — now binds `127.0.0.1` by default; `admin_host`/`PGVPD_ADMIN_HOST` opts into wider exposure. Suite 12 (`tests/admin-bind.mjs`) asserts default is loopback-only and opt-in works. A bearer token is still open. |
 | threat model document | have — `docs/threat-model.md` (trusted app, pool password scope, what the username encodes, what the admin port reveals, out-of-scope attackers) |
 
 ### 8. Observability

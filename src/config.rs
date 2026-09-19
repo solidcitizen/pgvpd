@@ -127,6 +127,10 @@ pub struct Cli {
     #[arg(long)]
     pub admin_port: Option<u16>,
 
+    /// Host/interface the admin API binds (default: 127.0.0.1)
+    #[arg(long)]
+    pub admin_host: Option<String>,
+
     /// Override SET ROLE target (default: use rewritten username)
     #[arg(long)]
     pub set_role: Option<String>,
@@ -178,6 +182,7 @@ pub struct Config {
     pub pool_checkout_timeout: u64,
     pub resolvers: Option<String>,
     pub admin_port: Option<u16>,
+    pub admin_host: String,
     pub set_role: Option<String>,
     pub tenant_allow: Option<Vec<String>>,
     pub tenant_deny: Option<Vec<String>>,
@@ -213,6 +218,7 @@ impl Default for Config {
             pool_checkout_timeout: 5,
             resolvers: None,
             admin_port: None,
+            admin_host: "127.0.0.1".into(),
             set_role: None,
             tenant_allow: None,
             tenant_deny: None,
@@ -312,6 +318,9 @@ impl Config {
         }
         if let Some(v) = cli.admin_port {
             config.admin_port = Some(v);
+        }
+        if let Some(v) = cli.admin_host {
+            config.admin_host = v;
         }
         if let Some(v) = cli.set_role {
             config.set_role = Some(v);
@@ -462,6 +471,7 @@ fn apply_config_file(config: &mut Config, content: &str) {
                     config.admin_port = Some(v);
                 }
             }
+            "admin_host" => config.admin_host = value,
             "set_role" => config.set_role = Some(value),
             "tenant_allow" => {
                 config.tenant_allow =
@@ -578,6 +588,9 @@ fn apply_env(config: &mut Config) {
         && let Ok(p) = v.parse()
     {
         config.admin_port = Some(p);
+    }
+    if let Ok(v) = std::env::var("PGVPD_ADMIN_HOST") {
+        config.admin_host = v;
     }
     if let Ok(v) = std::env::var("PGVPD_SET_ROLE") {
         config.set_role = Some(v);

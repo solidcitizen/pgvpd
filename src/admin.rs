@@ -28,15 +28,19 @@ pub struct AdminState {
     pub resolver: Option<Arc<ResolverEngine>>,
 }
 
-/// Start the admin HTTP server on the given port.
-pub async fn serve(state: AdminState, port: u16) {
+/// Start the admin HTTP server on the given host and port.
+///
+/// The admin endpoints are unauthenticated and `/status` + `/metrics` reveal
+/// pool topology (databases, roles, bucket counts), so the bind host defaults to
+/// `127.0.0.1` (issue #13). Set `admin_host` to expose it deliberately.
+pub async fn serve(state: AdminState, host: String, port: u16) {
     let app = Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .route("/status", get(status))
         .with_state(state);
 
-    let addr = format!("0.0.0.0:{port}");
+    let addr = format!("{host}:{port}");
     match TcpListener::bind(&addr).await {
         Ok(listener) => {
             info!(addr = %addr, "admin API");

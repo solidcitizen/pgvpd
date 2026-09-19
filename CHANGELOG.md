@@ -5,6 +5,13 @@ All notable changes to pgvpd are documented here.
 ## [Unreleased]
 
 ### Fixed
+- Admin API bound `0.0.0.0` unconditionally, exposing the unauthenticated
+  `/status` and `/metrics` endpoints — which reveal pool topology (every
+  `database`, `role`, and bucket count) — on every interface. On a multi-homed
+  host this leaked the tenant/role namespace to anything that could route to the
+  port. The admin API now binds `127.0.0.1` by default; set `admin_host`
+  (config), `--admin-host` (CLI), or `PGVPD_ADMIN_HOST` (env) to expose it
+  deliberately. Pre-existing since the admin API (0.5). (#13)
 - Handshake-phase read loops ignored EOF. `read_buf` returns `Ok(0)` when the
   peer closes its socket; that is not an error, but the startup, upstream-auth
   (cleartext/MD5/SCRAM), post-auth, pooled reset (`DISCARD ALL`), context

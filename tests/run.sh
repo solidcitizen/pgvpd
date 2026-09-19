@@ -824,6 +824,35 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Suite 12: Admin API must not bind all interfaces by default (issue #13)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# /status and /metrics are unauthenticated and reveal pool topology, so the
+# admin API must default to 127.0.0.1 and only bind wider when PGVPD_ADMIN_HOST
+# is set. The harness spawns its own pgvpd (no upstream needed) and checks the
+# admin port is reachable on loopback but not on a non-loopback address by
+# default, and reachable off-host only with the opt-in.
+
+if ! command -v node &>/dev/null; then
+  echo ""
+  echo "═══ Suite 12: Admin bind (SKIPPED — node not found) ═══"
+else
+  echo ""
+  echo "═══ Suite 12: Admin API bind host ═══"
+  case "$PGVPD_BIN" in
+    /*) ADMIN_BIN="$PGVPD_BIN" ;;
+    *)  ADMIN_BIN="$(pwd)/$PGVPD_BIN" ;;
+  esac
+  admin_bind_result=0
+  PGVPD_BIN="$ADMIN_BIN" node tests/admin-bind.mjs || admin_bind_result=$?
+  if [ $admin_bind_result -eq 0 ]; then
+    pass "12.1 Admin bind — defaults to 127.0.0.1, opt-in exposes (issue #13)"
+  else
+    fail "12.1 Admin bind — default reachable off-host or opt-in ignored (exit $admin_bind_result)"
+  fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Summary
 # ═══════════════════════════════════════════════════════════════════════════
 

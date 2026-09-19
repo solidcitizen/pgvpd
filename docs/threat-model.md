@@ -43,12 +43,14 @@ Consequences:
   `127.0.0.1` for this reason.
 - Do not expose the proxy port through a load balancer to the internet, even
   with TLS. TLS protects the wire, not the assertion.
-- The admin API (`admin_port`) currently binds all interfaces and has no
-  authentication (issue #13). The exposure is `/status`, which reveals database
-  names, roles and pool occupancy. `/metrics` carries only aggregate counters,
-  including rejections grouped by reason (`reason="deny|limit|rate"`) — no
-  tenant identifiers or row data. Until the bind default and token land,
-  restrict the admin port with a host firewall.
+- The admin API (`admin_port`) binds `127.0.0.1` by default and has no
+  authentication (issue #13, fixed 1.0.6). Its exposure is `/status`, which
+  reveals database names, roles and pool occupancy; `/metrics` carries only
+  aggregate counters, including rejections grouped by reason
+  (`reason="deny|limit|rate"`) — no tenant identifiers or row data. Set
+  `admin_host` (or `PGVPD_ADMIN_HOST`) only to expose it deliberately, and where
+  it must be reachable off-host, still restrict the port with a host firewall
+  (there is no auth token yet).
 
 ## What an attacker can do
 

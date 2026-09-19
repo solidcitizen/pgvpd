@@ -41,6 +41,7 @@ The script handles everything: starts Postgres in Docker, loads fixtures, builds
 | 9.2 | Pool | Not wedged after cancels | Fresh checkout is not blocked by leaked slots (issue #20) |
 | 10.1 | Logging | Parent closes both stdio pipes | Connections survive; logging never panics a task (issue #21) |
 | 11.1 | Handshake | Client connects and closes during handshake | Task ends promptly, no busy-spin to the handshake timeout (issue #24) |
+| 12.1 | Admin API | Default vs. opt-in bind host | Admin API defaults to 127.0.0.1, not reachable off-host; PGVPD_ADMIN_HOST opts in (issue #13) |
 
 ## Diagnostics
 
