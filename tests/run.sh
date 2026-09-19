@@ -794,6 +794,36 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Suite 11: Handshake EOF must not busy-spin (issue #24)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# A client that connects and closes during the handshake must not spin its
+# connection task at 100% CPU until the handshake timeout. The harness spawns
+# its own pgvpd (no upstream needed — the close happens during the startup read)
+# with a 1s handshake timeout, fires a burst of connect-and-close events, and
+# asserts no per-connection "handshake timeout" is logged and the proxy still
+# accepts. Before the fix every handshake-phase read loop ignored EOF (Ok(0)).
+
+if ! command -v node &>/dev/null; then
+  echo ""
+  echo "═══ Suite 11: Handshake EOF spin (SKIPPED — node not found) ═══"
+else
+  echo ""
+  echo "═══ Suite 11: Handshake EOF must not busy-spin ═══"
+  case "$PGVPD_BIN" in
+    /*) EOF_BIN="$PGVPD_BIN" ;;
+    *)  EOF_BIN="$(pwd)/$PGVPD_BIN" ;;
+  esac
+  eof_result=0
+  PGVPD_BIN="$EOF_BIN" node tests/eof-storm.mjs || eof_result=$?
+  if [ $eof_result -eq 0 ]; then
+    pass "11.1 Handshake EOF — connect-and-close ends promptly, no spin (issue #24)"
+  else
+    fail "11.1 Handshake EOF — connect-and-close spun to handshake timeout (exit $eof_result)"
+  fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Summary
 # ═══════════════════════════════════════════════════════════════════════════
 

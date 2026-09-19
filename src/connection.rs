@@ -26,7 +26,7 @@ use crate::protocol::{
     try_read_startup,
 };
 use crate::resolver::ResolverEngine;
-use crate::stream::{ClientStream, UpstreamStream};
+use crate::stream::{ClientStream, UpstreamStream, read_or_eof};
 use crate::tenant::{TenantGuard, TenantRegistry};
 use crate::tls::parse_server_name;
 
@@ -359,7 +359,7 @@ async fn handshake(
     let mut buf = BytesMut::with_capacity(1024);
 
     let startup = loop {
-        client.read_buf(&mut buf).await?;
+        read_or_eof(client, &mut buf).await?;
 
         match try_read_startup(&mut buf) {
             Some(StartupType::SslRequest) => {
@@ -554,7 +554,7 @@ async fn handle_passthrough(
     let mut auth_done = false;
 
     while !auth_done {
-        server.read_buf(&mut server_buf).await?;
+        read_or_eof(&mut server, &mut server_buf).await?;
 
         while let Some(msg) = try_read_backend_message(&mut server_buf) {
             if msg.is_auth_ok() {
@@ -572,7 +572,7 @@ async fn handle_passthrough(
 
             if msg.is_auth_challenge() {
                 let mut client_buf = BytesMut::with_capacity(1024);
-                client.read_buf(&mut client_buf).await?;
+                read_or_eof(client, &mut client_buf).await?;
                 server.write_all(&client_buf).await?;
             }
         }
@@ -582,7 +582,7 @@ async fn handle_passthrough(
 
     let buffered_ready: BytesMut = loop {
         if server_buf.is_empty() {
-            server.read_buf(&mut server_buf).await?;
+            read_or_eof(&mut server, &mut server_buf).await?;
         }
 
         let mut ready_msg = None;
@@ -697,7 +697,7 @@ async fn handle_pooled(
     server.write_all(&reset_msg).await?;
 
     loop {
-        server.read_buf(&mut server_buf).await?;
+        read_or_eof(&mut server, &mut server_buf).await?;
         let mut done = false;
         while let Some(msg) = try_read_backend_message(&mut server_buf) {
             if msg.is_error_response() {
@@ -758,7 +758,7 @@ async fn handle_pooled(
     server.write_all(&query_msg).await?;
 
     loop {
-        server.read_buf(&mut server_buf).await?;
+        read_or_eof(&mut server, &mut server_buf).await?;
         let mut done = false;
         while let Some(msg) = try_read_backend_message(&mut server_buf) {
             if msg.is_error_response() {
@@ -866,7 +866,7 @@ async fn inject_context_from_map(
     server.write_all(&query_msg).await?;
 
     loop {
-        server.read_buf(server_buf).await?;
+        read_or_eof(server, server_buf).await?;
 
         let mut injection_done = false;
         while let Some(msg) = try_read_backend_message(server_buf) {

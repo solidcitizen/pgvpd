@@ -19,7 +19,7 @@ use crate::metrics::Metrics;
 use crate::protocol::{
     BackendFrameTracker, build_query_message, build_startup_message, try_read_backend_message,
 };
-use crate::stream::UpstreamStream;
+use crate::stream::{UpstreamStream, read_or_eof};
 
 /// Pool key — identifies a bucket of reusable connections.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -354,7 +354,9 @@ impl Pool {
             return false;
         }
         loop {
-            if stream.read_buf(buf).await.is_err() {
+            // read_or_eof so an upstream that FINs mid-reset ends the drain
+            // promptly instead of spinning until reset_timeout.
+            if read_or_eof(stream, buf).await.is_err() {
                 return false;
             }
             while let Some(msg) = try_read_backend_message(buf) {
@@ -402,7 +404,7 @@ impl Pool {
 
         loop {
             if server_buf.is_empty() {
-                server.read_buf(&mut server_buf).await?;
+                read_or_eof(&mut server, &mut server_buf).await?;
             }
 
             let mut ready = false;

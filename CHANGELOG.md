@@ -2,6 +2,24 @@
 
 All notable changes to pgvpd are documented here.
 
+## [Unreleased]
+
+### Fixed
+- Handshake-phase read loops ignored EOF. `read_buf` returns `Ok(0)` when the
+  peer closes its socket; that is not an error, but the startup, upstream-auth
+  (cleartext/MD5/SCRAM), post-auth, pooled reset (`DISCARD ALL`), context
+  injection, pool-connection-create, and checkin-reset loops all treated `Ok(0)`
+  as "no data yet" and looped again. A client (or upstream) that closed mid-
+  handshake therefore returned `Ok(0)` immediately and forever, spinning the
+  connection task at ~100% CPU until the handshake timeout (30s) or reset timeout
+  (5s) fired. A connect-and-close storm pinned one spinning core per event and
+  logged a spurious per-connection "handshake timeout". Measured: 15 events with
+  a 1s handshake timeout burned ~8 CPU-seconds on 1.0.5, ~0 after the fix. Every
+  such loop now reads through a single `stream::read_or_eof` helper that maps
+  `Ok(0)` to a prompt `UnexpectedEof`, mirroring the steady-state pipe (which
+  already handled EOF since #11). Availability/CPU class, bounded by the loopback
+  trust model. Pre-existing (all versions). (#24)
+
 ## [1.0.5] — 2026-09-18
 
 ### Fixed

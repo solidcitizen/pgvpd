@@ -40,6 +40,7 @@ The script handles everything: starts Postgres in Docker, loads fixtures, builds
 | 9.1 | Pool | Cancelled checkout (black-hole upstream) | Reserved slot released; bucket total returns to 0 (issue #20) |
 | 9.2 | Pool | Not wedged after cancels | Fresh checkout is not blocked by leaked slots (issue #20) |
 | 10.1 | Logging | Parent closes both stdio pipes | Connections survive; logging never panics a task (issue #21) |
+| 11.1 | Handshake | Client connects and closes during handshake | Task ends promptly, no busy-spin to the handshake timeout (issue #24) |
 
 ## Diagnostics
 
