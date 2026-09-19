@@ -129,12 +129,9 @@ fn connect_and_auth(
             }
             3 => {
                 // Cleartext password
-                if let Some(pw) = password {
-                    let pw_msg = build_password_msg(pw);
-                    stream.write_all(&pw_msg).ok()?;
-                } else {
-                    return None;
-                }
+                let pw = password?;
+                let pw_msg = build_password_msg(pw);
+                stream.write_all(&pw_msg).ok()?;
             }
             _ => return None, // Unsupported auth for benchmark
         }
