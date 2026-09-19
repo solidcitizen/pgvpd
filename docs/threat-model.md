@@ -108,4 +108,3 @@ register); operators can bound it with `tenant_query_timeout`.
   (`tenant_max_connections`, `tenant_rate_limit`, `tenant_query_timeout`).
 - Replication protocol and `LISTEN`/`NOTIFY` delivery across pooled
   hand-offs (not supported in pool mode).
-- Query cancellation through the proxy (issue #12).

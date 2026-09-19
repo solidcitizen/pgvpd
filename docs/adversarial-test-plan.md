@@ -158,12 +158,18 @@ Fix shape: a `ConnectionGuard` that inc's on construction, dec's on `Drop`
 
 ### 6. Cancel semantics
 
-Issue #12. Today `CancelRequest` is closed unforwarded and every client gets
-the bucket's cached `BackendKeyData`, so cancel is a no-op — safe, but wrong.
+**Fixed 1.0.6 (#12, #14).** Each client is handed pgvpd's own minted
+`BackendKeyData`; a registry maps that key to the client's current upstream
+connection, so a `CancelRequest` is routed only to the issuing client's query.
+A client that abandons an in-flight query has it cancelled upstream at checkin
+(#14). Previously CancelRequest was dropped and every client shared the bucket's
+cached key, so a forwarded cancel could have hit another tenant.
 
 | Coverage | Tests | Mutant |
 |---|---|---|
-| gap | after #12: cancel from holder A must cancel A's backend only; a forged key must be refused; cancel of an idle slot is a no-op | forward with the cached key |
+| have — routing + isolation | Suite 14 (`tests/drizzle/cancel-isolation.mjs`): two tenants, cancel one → only its query aborts (57014), the other completes. Unit tests in `cancel.rs` and `protocol.rs` (key round-trips, unknown key = no-op). | forward with the cached key / drop the registry |
+| have — orphan cancel | Suite 15 (`tests/drizzle/orphan-cancel.mjs`): client drops mid-query → the orphan is cancelled upstream, not left active. | skip the checkin cancel |
+| gap — forged key refused explicitly | isolation already implies a random cancel key disturbs nothing; add an explicit case | — |
 
 ### 7. Trust boundary
 
@@ -195,7 +201,7 @@ trusted party. The boundary must therefore be the network.
 | drizzle batching/transactions | partial (7.4); add pool-mode transaction test |
 | SSL to upstream | gap in CI — add a self-signed cert Postgres service and `upstream_tls = true` conf |
 | `COPY`, large results | gap — add `COPY TO STDOUT` of `generate_series(1, 2e6)` through the pool; assert byte-exact against direct |
-| explicit out-of-scope | document: `LISTEN/NOTIFY` in pool mode (reset unlistens; notifications not delivered across hand-offs), replication protocol, `CancelRequest` until #12 |
+| explicit out-of-scope | document: `LISTEN/NOTIFY` in pool mode (reset unlistens; notifications not delivered across hand-offs), replication protocol. `CancelRequest` is supported as of 1.0.6 (#12). |
 
 ### 10. Chaos
 

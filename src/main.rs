@@ -1,5 +1,6 @@
 mod admin;
 mod auth;
+mod cancel;
 mod config;
 mod connection;
 mod metrics;

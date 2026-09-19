@@ -4,7 +4,20 @@ All notable changes to pgvpd are documented here.
 
 ## [1.0.6] — 2026-09-18
 
+### Added
+- Pool mode: query cancellation now works and is tenant-isolated (#12). Each
+  client is handed pgvpd's OWN minted BackendKeyData instead of the bucket-shared
+  upstream key; a `CancelRequest` is routed through a registry to that client's
+  current upstream connection alone. Previously CancelRequest was dropped (a
+  no-op) and every client shared one cancel key, so a forwarded cancel could have
+  hit another tenant's query. A regression suite proves a cancel aborts only the
+  issuing client's query (57014) and leaves a concurrent tenant untouched.
+
 ### Fixed
+- Pool mode: a client that dropped an in-flight query left it running upstream
+  until the checkin drain timed out (up to 5s), pinning the pooled slot. pgvpd
+  now cancels the orphaned query at checkin (using the connection's real backend
+  key) so the slot is reclaimed promptly. (#14)
 - Pool mode: a pooled connection whose upstream had gone away (Postgres
   restart, failover, or an administrator terminating the backend) failed the
   next client that checked it out — the `DISCARD ALL` reset hit a dead socket or

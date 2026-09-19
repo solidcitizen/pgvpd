@@ -43,6 +43,8 @@ The script handles everything: starts Postgres in Docker, loads fixtures, builds
 | 11.1 | Handshake | Client connects and closes during handshake | Task ends promptly, no busy-spin to the handshake timeout (issue #24) |
 | 12.1 | Admin API | Default vs. opt-in bind host | Admin API defaults to 127.0.0.1, not reachable off-host; PGVPD_ADMIN_HOST opts in (issue #13) |
 | 13.1 | Pool | Upstream backends killed under the pool | Dead pooled connection discarded and checkout retried on a fresh one; client not victimized (issue #15) |
+| 14.1 | Pool | Two tenants, cancel one | Cancel routed to the issuing client's query only (57014); other tenant unaffected (issue #12) |
+| 15.1 | Pool | Client drops mid-query | Orphaned query cancelled upstream at checkin, not left running (issue #14) |
 
 ## Diagnostics
 

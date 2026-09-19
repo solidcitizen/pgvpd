@@ -881,6 +881,59 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Suite 14: Query cancel is routed and isolated (issue #12)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# A client's CancelRequest must cancel ONLY its own upstream query, never another
+# tenant's. Two tenants run concurrent sleeps on the same bucket; cancelling one
+# must abort it (57014) and leave the other running.
+
+if ! command -v node &>/dev/null; then
+  echo ""
+  echo "═══ Suite 14: Cancel isolation (SKIPPED — node not found) ═══"
+else
+  echo ""
+  echo "═══ Suite 14: Query cancel routing + isolation ═══"
+  case "$PGVPD_BIN" in
+    /*) CANCEL_BIN="$PGVPD_BIN" ;;
+    *)  CANCEL_BIN="$(pwd)/$PGVPD_BIN" ;;
+  esac
+  cancel_result=0
+  (cd tests/drizzle && PGVPD_BIN="$CANCEL_BIN" UP_HOST=$PG_HOST UP_PORT=$PG_PORT PG_DB=$PG_DB PG_PASS=$PG_PASS node cancel-isolation.mjs) || cancel_result=$?
+  if [ $cancel_result -eq 0 ]; then
+    pass "14.1 Cancel routing — cancels own query only, other tenant unaffected (issue #12)"
+  else
+    fail "14.1 Cancel routing — cancel misrouted or no-op (exit $cancel_result)"
+  fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Suite 15: Orphaned query is cancelled on client disconnect (issue #14)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# A client that drops mid-query must not leave its query running upstream: pgvpd
+# cancels the orphan at checkin instead of waiting out the drain.
+
+if ! command -v node &>/dev/null; then
+  echo ""
+  echo "═══ Suite 15: Orphan cancel (SKIPPED — node not found) ═══"
+else
+  echo ""
+  echo "═══ Suite 15: Orphaned query cancelled on disconnect ═══"
+  case "$PGVPD_BIN" in
+    /*) ORPHAN_BIN="$PGVPD_BIN" ;;
+    *)  ORPHAN_BIN="$(pwd)/$PGVPD_BIN" ;;
+  esac
+  orphan_result=0
+  (cd tests/drizzle && PGVPD_BIN="$ORPHAN_BIN" UP_HOST=$PG_HOST UP_PORT=$PG_PORT PG_DB=$PG_DB PG_PASS=$PG_PASS node orphan-cancel.mjs) || orphan_result=$?
+  if [ $orphan_result -eq 0 ]; then
+    pass "15.1 Orphan cancel — abandoned query cancelled upstream (issue #14)"
+  else
+    fail "15.1 Orphan cancel — abandoned query left running (exit $orphan_result)"
+  fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Summary
 # ═══════════════════════════════════════════════════════════════════════════
 

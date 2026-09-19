@@ -17,7 +17,8 @@ use crate::config::Config;
 use crate::connection::{PipeEnd, PipeOutcome, connect_upstream};
 use crate::metrics::Metrics;
 use crate::protocol::{
-    BackendFrameTracker, build_query_message, build_startup_message, try_read_backend_message,
+    BackendFrameTracker, build_cancel_request, build_query_message, build_startup_message,
+    parse_backend_key_data, try_read_backend_message,
 };
 use crate::stream::{UpstreamStream, read_or_eof};
 
@@ -38,6 +39,12 @@ pub struct PooledConn {
     pub param_statuses: Vec<BytesMut>,
     /// Cached BackendKeyData message from the initial handshake.
     pub backend_key_data: BytesMut,
+    /// This connection's REAL upstream backend key (pid, secret), parsed once at
+    /// creation and preserved for the connection's whole pooled life. Used to
+    /// route a CancelRequest to this exact backend. Unlike `backend_key_data`
+    /// (which is reset and re-attached from the bucket cache on reuse), this must
+    /// stay tied to the physical connection.
+    pub real_key: Option<(u32, u32)>,
 }
 
 struct PoolBucket {
@@ -219,6 +226,7 @@ impl Pool {
         &self,
         key: PoolKey,
         mut stream: UpstreamStream,
+        real_key: Option<(u32, u32)>,
         conn_id: u64,
         mut outcome: PipeOutcome,
     ) {
@@ -265,6 +273,14 @@ impl Pool {
                     outstanding,
                     "pool: client left with responses outstanding — draining before reset"
                 );
+                // The client abandoned an in-flight query. Cancel it upstream so
+                // the drain doesn't have to wait the whole query out before the
+                // slot can be reused (issue #14). Best-effort and advisory.
+                if outstanding > 0
+                    && let Some((pid, secret)) = real_key
+                {
+                    self.cancel_upstream_query(pid, secret, conn_id).await;
+                }
                 if !Self::drain_outstanding(
                     &mut stream,
                     &mut outcome.tracker,
@@ -291,19 +307,17 @@ impl Pool {
                 Metrics::inc(&self.metrics.pool_checkins);
                 let mut buckets = self.lock_buckets();
                 if let Some(bucket) = buckets.get_mut(&key) {
-                    // Re-create a minimal PooledConn for the idle queue
-                    // (param_statuses and backend_key_data are preserved from creation)
-                    // We need to store them separately, but for simplicity we store
-                    // a placeholder — they were cached at creation time.
-                    // Actually, we need to preserve the original cached data.
-                    // The approach: store param_statuses/backend_key_data on the bucket level.
-                    // For now, push with empty caches — checkout will use whatever was cached.
+                    // Return to the idle queue. param_statuses/backend_key_data
+                    // are re-attached from the bucket cache on checkout, so they
+                    // are left empty here; real_key stays tied to this physical
+                    // connection so a later checkout can still route a cancel.
                     bucket.idle.push_back(PooledConn {
                         stream,
-                        created_at: Instant::now(), // Not ideal, but functional
+                        created_at: Instant::now(),
                         last_used: Instant::now(),
                         param_statuses: Vec::new(),
                         backend_key_data: BytesMut::new(),
+                        real_key,
                     });
                     debug!(conn_id, database = %key.database, role = %key.role, "pool: connection returned");
                 } else {
@@ -429,12 +443,14 @@ impl Pool {
         }
 
         let now = Instant::now();
+        let real_key = parse_backend_key_data(&backend_key_data);
         Ok(PooledConn {
             stream: server,
             created_at: now,
             last_used: now,
             param_statuses,
             backend_key_data,
+            real_key,
         })
     }
 
@@ -481,6 +497,21 @@ impl Pool {
         let mut buckets = self.lock_buckets();
         if let Some(bucket) = buckets.get_mut(key) {
             bucket.total = bucket.total.saturating_sub(1);
+        }
+    }
+
+    /// Best-effort: open a fresh connection to upstream and send a CancelRequest
+    /// for `(pid, secret)`. PostgreSQL requires a cancel on a separate
+    /// connection and sends no reply, so this connects, writes, and closes.
+    /// Failures are ignored — a cancel is advisory.
+    async fn cancel_upstream_query(&self, pid: u32, secret: u32, conn_id: u64) {
+        match connect_upstream(&self.config, &self.upstream_tls).await {
+            Ok(mut c) => {
+                let _ = c.write_all(&build_cancel_request(pid, secret)).await;
+                let _ = c.shutdown().await;
+                debug!(conn_id, pid, "pool: sent cancel for orphaned query");
+            }
+            Err(e) => debug!(conn_id, error = %e, "pool: cancel connect failed"),
         }
     }
 
@@ -544,10 +575,18 @@ impl PoolLease {
     }
 
     /// Return the connection to the pool (or discard it), consuming the lease.
-    pub async fn checkin(mut self, stream: UpstreamStream, conn_id: u64, outcome: PipeOutcome) {
+    /// `real_key` is this connection's upstream backend key, preserved so the
+    /// pool can route a cancel and re-tag the idle connection.
+    pub async fn checkin(
+        mut self,
+        stream: UpstreamStream,
+        real_key: Option<(u32, u32)>,
+        conn_id: u64,
+        outcome: PipeOutcome,
+    ) {
         self.armed = false;
         let pool = Arc::clone(&self.pool);
-        pool.checkin(self.key.clone(), stream, conn_id, outcome)
+        pool.checkin(self.key.clone(), stream, real_key, conn_id, outcome)
             .await;
     }
 }
